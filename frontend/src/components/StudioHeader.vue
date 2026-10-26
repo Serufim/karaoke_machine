@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useProjectStore } from '@/stores/project'
+import { useModelsStore } from '@/stores/models'
 import {
   Mic,
   PlusCircle,
@@ -10,16 +11,25 @@ import {
   Redo2,
   FolderOpen,
   RefreshCw,
+  Cpu,
+  HardDrive,
 } from 'lucide-vue-next'
 
 const emit = defineEmits<{
   (e: 'open-new'): void
   (e: 'open-export'): void
+  (e: 'open-models'): void
 }>()
 
 const projectStore = useProjectStore()
+const modelsStore = useModelsStore()
+
+onMounted(() => {
+  modelsStore.fetchHardware()
+})
 
 const currentTitle = computed(() => projectStore.currentProject?.title || '')
+
 
 function onSelectProject(e: Event) {
   const target = e.target as HTMLSelectElement
@@ -97,6 +107,22 @@ function onSelectProject(e: Event) {
         class="p-1.5 rounded text-slate-300 hover:text-white hover:bg-studio-surface disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
       >
         <Redo2 class="w-4 h-4" />
+      </button>
+
+      <!-- Hardware & Models Button -->
+      <button
+        @click="emit('open-models')"
+        class="flex items-center space-x-1.5 px-2.5 py-1.5 text-xs font-medium rounded bg-studio-surface hover:bg-slate-700 text-slate-200 border border-studio-border transition-colors"
+        title="Менеджер моделей и параметры оборудования"
+      >
+        <span
+          class="w-2 h-2 rounded-full"
+          :class="modelsStore.hardware?.gpu_type === 'cuda' ? 'bg-emerald-400' : modelsStore.hardware?.gpu_type === 'mps' ? 'bg-sky-400' : 'bg-amber-400'"
+        ></span>
+        <HardDrive class="w-3.5 h-3.5 text-studio-muted" />
+        <span class="max-w-[130px] truncate hidden md:inline">
+          {{ modelsStore.hardware ? (modelsStore.hardware.gpu_type === 'cuda' ? 'CUDA ' + modelsStore.hardware.vram_gb + 'G' : modelsStore.hardware.gpu_type === 'mps' ? 'Apple Silicon' : 'CPU Режим') : 'Модели' }}
+        </span>
       </button>
 
       <div class="h-5 w-px bg-studio-border"></div>

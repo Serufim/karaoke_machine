@@ -57,12 +57,54 @@ export interface ProjectMeta {
 }
 
 export interface PipelineProgress {
-  type: 'progress' | 'completed' | 'cancelled' | 'error'
-  fraction: number
-  message: string
+  type: 'progress' | 'completed' | 'cancelled' | 'error' | 'model_progress'
+  fraction?: number
+  message?: string
   stage?: string
   title?: string
   action?: string
   video_path?: string
   success?: boolean
+  model_id?: string
+  status?: string
+  progress?: number
 }
+
+export interface HardwareProfile {
+  platform: string
+  os_name: string
+  architecture: string
+  cpu_name: string
+  cpu_cores: number
+  ram_gb: number
+  gpu_type: 'cuda' | 'mps' | 'cpu'
+  gpu_name: string
+  vram_gb: number
+  cuda_available: boolean
+  cuda_version: string | null
+  cuda_compute_capability: string | null
+  mps_available: boolean
+  tier: 'ultra' | 'high' | 'medium' | 'low'
+  recommended_whisper: string
+  recommended_demucs: string
+  allow_fp16: boolean
+  status_summary: string
+}
+
+export interface ModelItem {
+  id: string
+  name: string
+  type: 'whisper' | 'demucs' | 'aligner'
+  description: string
+  download_size_mb: number
+  min_vram_gb: number
+  min_ram_gb: number
+  recommended_for: string
+  is_default: boolean
+  is_hf: boolean
+  is_downloaded: boolean
+  size_on_disk_mb: number | null
+  status: 'ready' | 'not_downloaded' | 'downloading' | 'error'
+  progress: number
+}
+

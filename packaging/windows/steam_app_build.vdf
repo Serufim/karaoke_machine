@@ -1,0 +1,21 @@
+"AppBuild"
+{
+	"AppID" "480" // Replace with your Steam App ID assigned by Steamworks
+	"Desc" "AI Karaoke Studio Windows Release"
+	"ContentRoot" "..\..\dist\AIKaraokeStudio\"
+	"BuildOutput" "..\..\dist\steam_output\"
+	"Preview" "0"
+
+	"Depots"
+	{
+		"481" // Replace with your Windows Content Depot ID
+		{
+			"FileMapping"
+			{
+				"LocalPath" "*"
+				"DepotPath" "."
+				"recursive" "1"
+			}
+		}
+	}
+}

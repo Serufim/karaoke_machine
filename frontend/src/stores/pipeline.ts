@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { PipelineProgress } from '@/types'
 import { useProjectStore } from './project'
+import { useModelsStore } from './models'
 
 export const usePipelineStore = defineStore('pipeline', () => {
   const isRunning = ref<boolean>(false)
@@ -38,6 +39,11 @@ export const usePipelineStore = defineStore('pipeline', () => {
   }
 
   function handleMessage(data: PipelineProgress) {
+    if (data.type === 'model_progress') {
+      const modelsStore = useModelsStore()
+      modelsStore.handleProgressEvent(data)
+      return
+    }
     if (data.type === 'progress') {
       isRunning.value = true
       progressFraction.value = data.fraction || 0

@@ -30,11 +30,23 @@ from karaoke.mixer import compute_waveform_peaks, detect_chorus_fx_intervals
 from karaoke.separator import DEMUCS_MODELS
 from karaoke.transcriber import WHISPER_MODELS
 from karaoke.video import extract_cover_edge_colors
+from karaoke.hardware import get_hardware_profile_dict
+from karaoke.model_manager import (
+    get_models_status_list,
+    start_model_download_background,
+    delete_model_cache,
+    MODEL_CATALOG,
+)
 
 router = APIRouter(prefix="/api")
 
 OUTPUT_DIR = Path("./output").resolve()
 WORK_DIR = OUTPUT_DIR / "work"
+
+
+class DownloadModelRequest(BaseModel):
+    model_id: str
+
 
 
 class RegroupRequest(BaseModel):
@@ -89,6 +101,59 @@ def get_available_models() -> Dict[str, List[str]]:
         "demucs": DEMUCS_MODELS,
         "whisper": WHISPER_MODELS,
     }
+
+
+@router.get("/system/hardware")
+def get_hardware_info() -> Dict[str, Any]:
+    """Returns detected hardware profile, GPU/CUDA/MPS capabilities, and recommended models."""
+    return get_hardware_profile_dict()
+
+
+@router.get("/models/catalog")
+def get_models_catalog() -> Dict[str, Any]:
+    """Returns all supported models with status (downloaded / in progress), disk size, and resource requirements."""
+    return {"models": get_models_status_list()}
+
+
+@router.post("/models/download")
+def download_model_endpoint(req: DownloadModelRequest) -> Dict[str, Any]:
+    """Triggers asynchronous download of model weights with progress reporting via WebSockets."""
+    if req.model_id not in MODEL_CATALOG:
+        raise HTTPException(status_code=404, detail=f"Model '{req.model_id}' is not in catalog")
+
+    def _progress_callback(info: Dict[str, Any]):
+        ws_manager.broadcast_sync({
+            "type": "model_progress",
+            "model_id": info["model_id"],
+            "status": info["status"],
+            "progress": info["progress"],
+            "message": info["message"],
+        })
+
+    start_model_download_background(req.model_id, progress_callback=_progress_callback)
+    return {
+        "status": "started",
+        "model_id": req.model_id,
+        "message": f"Загрузка модели {req.model_id} запущена",
+    }
+
+
+@router.delete("/models/{model_id:path}")
+def delete_model_endpoint(model_id: str) -> Dict[str, Any]:
+    """Deletes cached model files to free disk space."""
+    if model_id not in MODEL_CATALOG:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' is not in catalog")
+
+    success = delete_model_cache(model_id)
+    if not success:
+        raise HTTPException(status_code=400, detail=f"Failed to delete model '{model_id}' (not found or in use)")
+
+    return {
+        "status": "deleted",
+        "model_id": model_id,
+        "message": f"Кэш модели {model_id} успешно очищен",
+    }
+
 
 
 @router.get("/projects")

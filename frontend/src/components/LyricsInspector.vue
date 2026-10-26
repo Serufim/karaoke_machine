@@ -139,7 +139,7 @@ async function handleAutoDetectFx() {
 </script>
 
 <template>
-  <aside class="w-80 bg-studio-panel flex flex-col shrink-0 select-none">
+  <aside class="w-full h-full bg-studio-panel flex flex-col shrink-0 select-none">
     <!-- Header -->
     <div class="h-10 px-3 border-b border-studio-border flex items-center justify-between text-xs font-semibold text-slate-300">
       <div class="flex items-center space-x-1.5">

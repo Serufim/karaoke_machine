@@ -59,6 +59,39 @@ def test_get_nonexistent_project():
     assert response.status_code == 404
 
 
+def test_hardware_profile_endpoint():
+    response = client.get("/api/system/hardware")
+    assert response.status_code == 200
+    data = response.json()
+    assert "platform" in data
+    assert "cpu_cores" in data
+    assert data["cpu_cores"] > 0
+    assert "ram_gb" in data
+    assert data["ram_gb"] > 0
+    assert "gpu_type" in data
+    assert data["gpu_type"] in ["cuda", "mps", "cpu"]
+    assert "tier" in data
+    assert data["tier"] in ["ultra", "high", "medium", "low"]
+    assert "recommended_whisper" in data
+    assert "recommended_demucs" in data
+
+
+def test_models_catalog_endpoint():
+    response = client.get("/api/models/catalog")
+    assert response.status_code == 200
+    data = response.json()
+    assert "models" in data
+    assert len(data["models"]) >= 5
+    ids = [m["id"] for m in data["models"]]
+    assert "large-v3-turbo" in ids
+    assert "htdemucs" in ids
+    for m in data["models"]:
+        assert "min_vram_gb" in m
+        assert "download_size_mb" in m
+        assert "status" in m
+
+
+
 def test_upload_cover_image(tmp_path):
     import io
     import json

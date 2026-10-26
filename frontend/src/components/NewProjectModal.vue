@@ -1,19 +1,25 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { usePipelineStore } from '@/stores/pipeline'
+import { useModelsStore } from '@/stores/models'
 import {
   X,
   Upload,
   Youtube,
   Settings2,
   FileAudio,
+  HardDrive,
+  CheckCircle,
+  AlertCircle,
 } from 'lucide-vue-next'
 
 const emit = defineEmits<{
   (e: 'close'): void
+  (e: 'open-models'): void
 }>()
 
 const pipelineStore = usePipelineStore()
+const modelsStore = useModelsStore()
 
 const activeTab = ref<'file' | 'url'>('file')
 const selectedFile = ref<File | null>(null)
@@ -27,6 +33,22 @@ const useCtcAlign = ref(false)
 const useVideoBg = ref(false)
 const vocalVolumePct = ref(0)
 const numLines = ref(4)
+
+onMounted(async () => {
+  await Promise.all([
+    modelsStore.fetchHardware(),
+    modelsStore.fetchCatalog(),
+  ])
+  if (modelsStore.hardware) {
+    if (modelsStore.hardware.recommended_whisper) {
+      modelSize.value = modelsStore.hardware.recommended_whisper
+    }
+    if (modelsStore.hardware.recommended_demucs) {
+      demucsModel.value = modelsStore.hardware.recommended_demucs
+    }
+  }
+})
+
 
 function onFileSelect(e: Event) {
   const target = e.target as HTMLInputElement
@@ -164,10 +186,21 @@ function onSubmit() {
 
         <!-- Advanced AI Settings -->
         <div class="pt-2 border-t border-studio-border space-y-3">
-          <div class="flex items-center space-x-2 text-xs font-semibold text-slate-300">
-            <Settings2 class="w-4 h-4 text-sky-400" />
-            <span>Параметры нейросетей</span>
+          <div class="flex items-center justify-between text-xs">
+            <div class="flex items-center space-x-2 font-semibold text-slate-300">
+              <Settings2 class="w-4 h-4 text-sky-400" />
+              <span>Параметры нейросетей</span>
+            </div>
+            <button
+              type="button"
+              @click="emit('open-models')"
+              class="text-sky-400 hover:text-sky-300 flex items-center space-x-1 text-[11px] font-medium"
+            >
+              <HardDrive class="w-3.5 h-3.5" />
+              <span>Менеджер моделей...</span>
+            </button>
           </div>
+
 
           <div class="grid grid-cols-2 gap-3 text-xs">
             <div>
