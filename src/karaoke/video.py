@@ -388,6 +388,7 @@ def render_karaoke_video(
     lyric_emoji_concat: Optional[Path] = None,
     emoji_particles: Optional[List[Dict[str, Any]]] = None,
     emoji_sprites: Optional[Dict[Tuple[str, int], Path]] = None,
+    guide_vocal_audio: Optional[Path] = None,
     progress_callback=None,
 ) -> Path:
     """
@@ -436,15 +437,21 @@ def render_karaoke_video(
     else:
         cmd.extend(["-loop", "1", "-framerate", str(fps), "-i", str(bg_file)])
 
-    # Input 1: instrumental audio
+    # Input 1: instrumental / backing audio
     cmd.extend(["-i", str(instrumental_audio.resolve())])
 
+    has_second_audio = bool(guide_vocal_audio and Path(guide_vocal_audio).exists())
+    if has_second_audio:
+        # Input 2: full vocal guide audio (100% vocals over instrumental for DJ/KJ instant toggle)
+        cmd.extend(["-i", str(Path(guide_vocal_audio).resolve())])
+
+    first_extra_idx = 3 if has_second_audio else 2
     particles = emoji_particles or []
     use_emoji_graph = bool(lyric_emoji_concat) or bool(particles and emoji_sprites)
 
     if use_emoji_graph:
         extra_inputs, graph = _build_emoji_filter_graph(
-            ass_escaped, fps, 2, lyric_emoji_concat, particles, emoji_sprites or {}, background_stream
+            ass_escaped, fps, first_extra_idx, lyric_emoji_concat, particles, emoji_sprites or {}, background_stream
         )
         cmd.extend(extra_inputs)
         cmd.extend(["-filter_complex", graph, "-map", "[outv]", "-map", "1:a:0"])
@@ -457,6 +464,17 @@ def render_karaoke_video(
             f"subtitles='{ass_escaped}'"
         )
         cmd.extend(["-vf", vf_filter, "-map", background_stream, "-map", "1:a:0"])
+
+    if has_second_audio:
+        cmd.extend([
+            "-map", "2:a:0",
+            "-metadata:s:a:0", "title=Karaoke / Instrumental",
+            "-metadata:s:a:0", "language=rus",
+            "-disposition:a:0", "default",
+            "-metadata:s:a:1", "title=Guide Vocal (100%)",
+            "-metadata:s:a:1", "language=rus",
+            "-disposition:a:1", "0",
+        ])
 
     q_cfg = BITRATE_PRESETS.get(video_quality, BITRATE_PRESETS["balanced"])
 
@@ -480,7 +498,8 @@ def render_karaoke_video(
         ])
 
     # Independent duration, frame-count and disk budgets prevent runaway output.
-    max_bitrate = int(q_cfg["maxrate"].rstrip("k")) * 1000 + 256_000
+    audio_budget = 512_000 if has_second_audio else 256_000
+    max_bitrate = int(q_cfg["maxrate"].rstrip("k")) * 1000 + audio_budget
     size_limit = math.ceil(duration * max_bitrate / 8 * 1.5) + 8 * 1024 * 1024
     cmd.extend([
         "-frames:v", str(math.ceil(duration * fps)),
@@ -539,6 +558,7 @@ def render_karaoke_video(
                 lyric_emoji_concat=lyric_emoji_concat,
                 emoji_particles=emoji_particles,
                 emoji_sprites=emoji_sprites,
+                guide_vocal_audio=guide_vocal_audio,
                 progress_callback=progress_callback,
             )
         else:

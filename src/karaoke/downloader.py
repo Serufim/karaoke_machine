@@ -62,11 +62,71 @@ def extract_cover_art(source_path: Path, output_cover_path: Path) -> Optional[Pa
     return None
 
 
+def create_procedural_cover(title: str, output_path: Path) -> Path:
+    """Creates a sleek, modern album art cover with gradient and vinyl elements when no ID3 cover art exists."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    size = 600
+    img = Image.new("RGB", (size, size), (15, 23, 42))
+    draw = ImageDraw.Draw(img)
+
+    # Stylized vertical gradient (Midnight Navy to Deep Indigo/Violet)
+    for y in range(size):
+        ratio = y / size
+        r = int(15 + ratio * 28)
+        g = int(23 + ratio * 12)
+        b = int(42 + ratio * 48)
+        draw.line([(0, y), (size, y)], fill=(r, g, b))
+
+    center_x = size // 2
+    center_y = size // 2 - 40
+
+    # Vinyl records concentric grooves
+    for radius in range(60, 210, 14):
+        alpha_color = (255, 255, 255) if radius % 28 == 0 else (148, 163, 184)
+        draw.ellipse(
+            [center_x - radius, center_y - radius, center_x + radius, center_y + radius],
+            outline=alpha_color,
+            width=1,
+        )
+
+    # Center vinyl record gold core
+    draw.ellipse(
+        [center_x - 55, center_y - 55, center_x + 55, center_y + 55],
+        fill=(245, 158, 11),
+        outline=(251, 191, 36),
+        width=3,
+    )
+    draw.ellipse(
+        [center_x - 14, center_y - 14, center_x + 14, center_y + 14],
+        fill=(15, 23, 42),
+    )
+
+    # Bottom badge with song title
+    display_title = title if len(title) <= 32 else title[:29] + "..."
+    draw.rounded_rectangle(
+        [(40, size - 100), (size - 40, size - 36)],
+        radius=14,
+        fill=(15, 23, 42),
+        outline=(245, 158, 11),
+        width=1,
+    )
+    draw.text(
+        (size // 2, size - 68),
+        display_title,
+        fill=(248, 250, 252),
+        anchor="mm",
+    )
+
+    img.save(output_path, "PNG")
+    return output_path
+
+
 def ensure_project_cover(title: str, work_dir: Path) -> Optional[Path]:
     """
     Finds or recovers cover art for a project:
     1. Checks if {title}_cover.png exists in work_dir.
     2. Searches TMPDIR/gradio for original uploaded {title}.mp3 and extracts cover.
+    3. If none found, generates a stylized procedural cover art image.
     """
     direct_cover = work_dir / f"{title}_cover.png"
     if direct_cover.exists() and direct_cover.stat().st_size > 1000:
@@ -86,7 +146,12 @@ def ensure_project_cover(title: str, work_dir: Path) -> Optional[Path]:
                     cover = extract_cover_art(candidate, direct_cover)
                     if cover:
                         return cover
-    return None
+
+    # Generate stylish fallback cover so the video never renders with an empty screen
+    try:
+        return create_procedural_cover(title, direct_cover)
+    except Exception:
+        return None
 
 
 def find_node_bin() -> Optional[str]:

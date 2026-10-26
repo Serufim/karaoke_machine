@@ -535,6 +535,7 @@ def generate_ass_from_lines(
     emoji_events_out: Optional[List[Dict[str, Any]]] = None,
     font_size_mode: str = "large",
     highlight_color: str = "gold_neon",
+    watermark_text: Optional[str] = None,
 ) -> Path:
     """
     Generates an Advanced SubStation Alpha (.ass) file with:
@@ -612,6 +613,9 @@ def generate_ass_from_lines(
     )
     styles_list.append(
         f"Style: FX_EdgePulse,Arial,20,{clean_sweep},&H00FFFFFF,{clean_sweep},&H00000000,0,0,0,0,100,100,0,0,1,10.0,0.0,7,0,0,0,1"
+    )
+    styles_list.append(
+        "Style: DJWatermark,Arial,28,&H30FFFFFF,&H30FFFFFF,&H50000000,&H80000000,-1,0,0,0,100,100,0.8,0,1,2.6,1.6,9,42,42,36,1"
     )
 
     styles_block = "\n".join(styles_list)
@@ -824,6 +828,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         prev_stanza_end = step_end[-1]
 
+    if watermark_text and watermark_text.strip():
+        raw_wm = watermark_text.replace("\n", " ").replace("{", "(").replace("}", ")").strip()
+        wm_segs = split_text_emoji(raw_wm)
+        clean_wm = "".join(seg if kind == "t" else "✦ " for kind, seg in wm_segs).strip()
+        if clean_wm:
+            dialogue_entries.append(
+                f"Dialogue: 3,{format_ass_time(0.0)},{format_ass_time(total_song_end)},"
+                f"DJWatermark,,0,0,0,,{clean_wm}"
+            )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(ass_header + "\n".join(dialogue_entries) + "\n")
@@ -846,6 +860,7 @@ def generate_ass_file(
     has_cover_card: bool = True,
     font_size_mode: str = "large",
     highlight_color: str = "gold_neon",
+    watermark_text: Optional[str] = None,
 ) -> Path:
     """
     High-level helper that splits a transcription result into verse-aware lines
@@ -866,4 +881,5 @@ def generate_ass_file(
         has_cover_card=has_cover_card,
         font_size_mode=font_size_mode,
         highlight_color=highlight_color,
+        watermark_text=watermark_text,
     )

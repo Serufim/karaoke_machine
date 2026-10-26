@@ -16,6 +16,7 @@ from karaoke.aligner import (
 )
 from karaoke.mixer import (
     mix_guide_vocals,
+    ensure_full_guide_mix,
     compute_waveform_peaks,
     detect_chorus_fx_intervals,
 )
@@ -166,6 +167,9 @@ def render_from_state(
     video_quality: str = "balanced",
     fx_intervals: Optional[List[Dict[str, Any]]] = None,
     emoji_intervals: Optional[List[Dict[str, Any]]] = None,
+    dual_audio_mp4: bool = True,
+    watermark_text: Optional[str] = None,
+    export_dj_pack: bool = False,
     progress_callback=None,
 ) -> Tuple[Path, Path, str]:
     """
@@ -222,7 +226,19 @@ def render_from_state(
         vocal_intervals=active_vocal_intervals,
     )
 
-    if background is None and (use_video_bg or state_data.get("use_video_bg", bool(state_data.get("video_bg")))) and state_data.get("video_bg"):
+    guide_full_wav: Optional[Path] = None
+    if dual_audio_mp4 and vocals_wav.exists():
+        guide_full_wav = ensure_full_guide_mix(
+            instrumental_path=no_vocals_wav,
+            vocals_path=vocals_wav,
+            output_path=work_dir / f"{title}_guide_100pct.wav",
+        )
+
+    effective_watermark = watermark_text if watermark_text is not None else state_data.get("watermark_text")
+
+    if use_cover_bg:
+        background = None
+    elif background is None and (use_video_bg or state_data.get("use_video_bg", bool(state_data.get("video_bg")))) and state_data.get("video_bg"):
         candidate_bg = Path(state_data["video_bg"])
         if not candidate_bg.exists():
             raise FileNotFoundError("Исходное видео проекта недоступно. Выберите замену в поле «Свой фон».")
@@ -249,6 +265,7 @@ def render_from_state(
         emoji_events_out=lyric_emoji_events,
         font_size_mode=font_size_mode,
         highlight_color=highlight_color,
+        watermark_text=effective_watermark,
     )
 
     # 1. Native Apple Color Emoji in lyrics (replaces tofu squares)
@@ -309,8 +326,20 @@ def render_from_state(
         lyric_emoji_concat=lyric_concat,
         emoji_particles=emoji_particles,
         emoji_sprites=emoji_sprites,
+        guide_vocal_audio=guide_full_wav,
         progress_callback=progress_callback,
     )
+
+    if export_dj_pack:
+        from karaoke.pro_exporter import export_dj_master_pack
+        export_dj_master_pack(
+            state_data=state_data,
+            output_dir=output_dir,
+            editor_text=updated_editor_text,
+            vocal_volume=vocal_volume,
+            vocal_intervals=active_vocal_intervals,
+            progress_callback=progress_callback,
+        )
 
     log(f"Готово! Караоке 1080p сохранено: {final_video_path}", 1.0)
     return final_video_path, backing_audio, updated_editor_text
@@ -337,6 +366,9 @@ def run_pipeline(
     device: Optional[str] = None,
     cookies_browser: Optional[str] = "chrome",
     cookies_file: Optional[Path] = None,
+    dual_audio_mp4: bool = True,
+    watermark_text: Optional[str] = None,
+    export_dj_pack: bool = False,
 ) -> Path:
     state_data = analyze_and_transcribe(
         source=source,
@@ -368,6 +400,9 @@ def run_pipeline(
         font_size_mode=font_size_mode,
         highlight_color=highlight_color,
         video_quality=video_quality,
+        dual_audio_mp4=dual_audio_mp4,
+        watermark_text=watermark_text,
+        export_dj_pack=export_dj_pack,
     )
     return final_video
 
@@ -393,6 +428,9 @@ def main():
     parser.add_argument("--num-lines", type=int, default=4, choices=[3, 4], help="Karaoke lines on screen (3 or 4)")
     parser.add_argument("--reference-lyrics", default=None, help="Reference text file for alignment")
     parser.add_argument("--use-ctc", action="store_true", help="Enable Cyrillic Wav2Vec2 CTC alignment")
+    parser.add_argument("--watermark", default=None, help="Custom DJ / Club branding watermark text in top-right corner")
+    parser.add_argument("--no-dual-audio", action="store_true", help="Disable multiplexing the 2nd 100%% vocal guide audio track into MP4")
+    parser.add_argument("--export-dj-pack", action="store_true", help="Also export professional DJ pack (.kfn, .cdg.zip, .lrc, UltraStar .txt)")
 
     args = parser.parse_args()
     ref_txt = Path(args.reference_lyrics).read_text(encoding="utf-8") if args.reference_lyrics else None
@@ -418,6 +456,9 @@ def main():
         use_ctc_align=args.use_ctc,
         cookies_browser=args.cookies_browser,
         cookies_file=c_file,
+        dual_audio_mp4=not args.no_dual_audio,
+        watermark_text=args.watermark,
+        export_dj_pack=args.export_dj_pack,
     )
 
 

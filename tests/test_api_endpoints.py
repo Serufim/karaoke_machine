@@ -129,3 +129,118 @@ def test_upload_cover_image(tmp_path):
             state_file.unlink()
         if cover_file.exists():
             cover_file.unlink()
+
+
+def test_export_dj_pack_endpoint(tmp_path):
+    import json
+    from pathlib import Path
+    import numpy as np
+    import soundfile as sf
+
+    output_dir = Path("./output").resolve()
+    work_dir = output_dir / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    title = "_test_dj_pack_api_"
+    state_file = work_dir / f"{title}_state.json"
+
+    sr = 44100
+    t = np.linspace(0, 1.5, int(sr * 1.5), endpoint=False)
+    inst_wav = tmp_path / "inst.wav"
+    voc_wav = tmp_path / "voc.wav"
+    sf.write(str(inst_wav), (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32), sr)
+    sf.write(str(voc_wav), (0.4 * np.sin(2 * np.pi * 440 * t)).astype(np.float32), sr)
+
+    lines = [[{"text": "Тест", "start": 0.2, "end": 0.8}, {"text": "диджей", "start": 0.85, "end": 1.3}]]
+    state_data = {
+        "title": title,
+        "vocals_wav": str(voc_wav),
+        "no_vocals_wav": str(inst_wav),
+        "lines": lines,
+        "editor_text": "[00:00.20 -> 00:01.30] Тест диджей",
+        "duration": 1.5,
+        "vocal_intervals": [],
+        "fx_intervals": [],
+    }
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        res = client.post(
+            f"/api/projects/{title}/export-dj-pack",
+            json={"vocal_volume": 0.1},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "ok"
+        assert data["dj_pack_filename"] == f"{title}_DJ_Pack.zip"
+        assert data["kfn_filename"] == f"{title}.kfn"
+
+        res_kfn = client.get(data["kfn_url"])
+        assert res_kfn.status_code == 200
+        assert res_kfn.content[:4] == b"KFNB"
+
+        res_zip = client.get(data["dj_pack_url"])
+        assert res_zip.status_code == 200
+        assert len(res_zip.content) > 1024
+    finally:
+        for f in [
+            state_file,
+            output_dir / f"{title}.kfn",
+            output_dir / f"{title}.lrc",
+            output_dir / f"{title}_ultrastar.txt",
+            output_dir / f"{title}_DJ_Pack.zip",
+            work_dir / f"{title}_cdg.zip",
+            work_dir / f"{title}_mix_10pct.wav",
+            work_dir / f"{title}_instrumental.mp3",
+            work_dir / f"{title}_vocals.mp3",
+        ]:
+            f.unlink(missing_ok=True)
+
+
+def test_rebuild_preserves_fx_intervals_in_state(tmp_path):
+    import json
+    from pathlib import Path
+
+    output_dir = Path("./output").resolve()
+    work_dir = output_dir / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    title = "_test_rebuild_fx_persist_"
+    state_file = work_dir / f"{title}_state.json"
+
+    initial_state = {
+        "title": title,
+        "vocals_wav": str(tmp_path / "vocals.wav"),
+        "no_vocals_wav": str(tmp_path / "no_vocals.wav"),
+        "lines": [],
+        "editor_text": "",
+        "duration": 5.0,
+        "vocal_intervals": [],
+        "fx_intervals": [],
+    }
+    state_file.write_text(json.dumps(initial_state, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        new_fx = [{"start": 1.0, "end": 4.0, "effect": "sparkles_pulse", "intensity": 0.9}]
+        new_vocal = [{"start": 2.0, "end": 3.5, "volume": 0.6}]
+
+        # Send rebuild request with new intervals
+        res = client.post(
+            "/api/pipeline/rebuild",
+            json={
+                "title": title,
+                "fx_intervals": new_fx,
+                "vocal_intervals": new_vocal,
+                "editor_text": "[00:01.00 -> 00:04.00] Припев с эффектами",
+                "use_cover_bg": True,
+            },
+        )
+        assert res.status_code == 200
+
+        # Verify state on disk is immediately updated and preserved
+        updated_state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert updated_state["fx_intervals"] == new_fx
+        assert updated_state["vocal_intervals"] == new_vocal
+        assert updated_state["use_cover_bg"] is True
+        assert "[00:01.00 -> 00:04.00]" in updated_state["editor_text"]
+    finally:
+        state_file.unlink(missing_ok=True)
+

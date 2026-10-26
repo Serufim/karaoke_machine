@@ -1296,6 +1296,8 @@ def run_full_karaoke_ui(
     demucs_model: str,
     language: str,
     use_ctc_align: bool,
+    dual_audio_mp4: bool = True,
+    watermark_text: str = "",
     progress=gr.Progress(track_tqdm=True),
 ):
     # A single upload accepts either audio or video; ffprobe detects its streams.
@@ -1351,8 +1353,12 @@ def run_full_karaoke_ui(
             background=bg_path,
             use_cover_bg=use_cover_bg,
             use_video_bg=effective_use_video_bg,
+            dual_audio_mp4=bool(dual_audio_mp4),
+            watermark_text=watermark_text.strip() if watermark_text else None,
             progress_callback=update_progress,
         )
+        if watermark_text is not None:
+            state_data["watermark_text"] = watermark_text.strip()
         choices = list_saved_states(output_dir)
         vocals_wav = state_data.get("vocals_wav")
         vocals_val = str(vocals_wav) if vocals_wav and Path(vocals_wav).exists() else None
@@ -1397,6 +1403,8 @@ def rebuild_video_from_editor_ui(
     num_lines: int,
     vocal_intervals_json: str,
     fx_intervals_json: str,
+    dual_audio_mp4: bool = True,
+    watermark_text: str = "",
     progress=gr.Progress(track_tqdm=True),
 ):
     if not state_data or "title" not in state_data:
@@ -1432,6 +1440,8 @@ def rebuild_video_from_editor_ui(
             background=bg_path,
             use_cover_bg=use_cover_bg,
             use_video_bg=use_video_bg,
+            dual_audio_mp4=bool(dual_audio_mp4),
+            watermark_text=watermark_text.strip() if watermark_text is not None else None,
             progress_callback=update_progress,
         )
         updated_lines = editor_text_to_lines(updated_editor_text, original_lines=state_data.get("lines", []))
@@ -1439,6 +1449,8 @@ def rebuild_video_from_editor_ui(
         state_data["editor_text"] = updated_editor_text
         state_data["vocal_intervals"] = vocal_intervals
         state_data["fx_intervals"] = fx_intervals
+        if watermark_text is not None:
+            state_data["watermark_text"] = watermark_text.strip()
         title = state_data["title"]
         state_file = output_dir / "work" / f"{title}_state.json"
         if state_file.parent.exists():
@@ -1467,6 +1479,47 @@ def rebuild_video_from_editor_ui(
         return (*[gr.skip() for _ in range(8)], str(e))
     except Exception as e:
         raise gr.Error(f"Ошибка при пересборке видео: {str(e)}")
+
+
+def export_dj_pack_ui(
+    state_data: Optional[Dict[str, Any]],
+    editor_text: str,
+    vocal_volume_pct: float,
+    vocal_intervals_json: str,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """Exports universal DJ / KJ Master Pack (.kfn, .cdg.zip, .lrc, UltraStar .txt, MP3 stems) on demand."""
+    if not state_data or "title" not in state_data:
+        raise gr.Error("Сначала распознайте трек или загрузите готовый проект из списка!")
+
+    from karaoke.pro_exporter import export_dj_master_pack
+
+    reset_cancel()
+    output_dir = Path("./output").resolve()
+    vocal_volume = float(vocal_volume_pct) / 100.0
+    vocal_intervals = _parse_intervals_json(vocal_intervals_json, state_data.get("vocal_intervals", []))
+
+    def update_progress(msg: str, frac: float):
+        progress(frac, desc=msg)
+
+    try:
+        dj_zip_path, kfn_path = export_dj_master_pack(
+            state_data=state_data,
+            output_dir=output_dir,
+            editor_text=editor_text,
+            vocal_volume=vocal_volume,
+            vocal_intervals=vocal_intervals,
+            progress_callback=update_progress,
+        )
+        return (
+            gr.update(value=[str(dj_zip_path), str(kfn_path)], visible=True),
+            f"🎧 Готов профессиональный DJ-пак: {dj_zip_path.name} и {kfn_path.name} (.KFN + .CDG + .LRC + UltraStar + MP3 стемы)",
+        )
+    except GenerationCancelledError as e:
+        gr.Warning(str(e))
+        return gr.skip(), str(e)
+    except Exception as e:
+        raise gr.Error(f"Ошибка при сборке DJ-пака: {str(e)}")
 
 
 def preview_background_image(file_path: Optional[str]):
@@ -1790,6 +1843,28 @@ def build_ui():
                             ],
                             value="balanced",
                         )
+                    with gr.Group():
+                        gr.Markdown("### 🎧 Проф. экспорт для DJ, ведущих и караоке-клубов (EnCore! / KaraFun / VirtualDJ)")
+                        dual_audio_cb = gr.Checkbox(
+                            label="🎚️ Dual-Audio MP4 (зашивать 2-ю аудиодорожку со 100% вокалом для переключения Минус/Плюс на лету)",
+                            value=True,
+                            info="В плеере EnCore!, VirtualDJ или VLC диджей может в 1 клик включить голос певца без остановки видео",
+                        )
+                        watermark_box = gr.Textbox(
+                            label="🏷️ Брендинг / Водяной знак DJ или Клуба (в правом верхнем углу экрана)",
+                            placeholder="Например: Karaoke by DJ Alex · Заказ песен: @djalex",
+                            value="",
+                        )
+                        export_dj_btn = gr.Button(
+                            "📦 Собрать универсальный DJ-пак (.KFN + .CDG + .LRC + UltraStar + MP3 стемы)",
+                            variant="secondary",
+                        )
+                        dj_pack_files = gr.File(
+                            label="📥 Готовые файлы DJ-пака (.zip и .kfn)",
+                            file_count="multiple",
+                            interactive=False,
+                            visible=False,
+                        )
 
 
             # 3-дорожечный интерактивный Таймлайн с синхронным Play и панелью эмодзи
@@ -1912,6 +1987,8 @@ def build_ui():
                 demucs_dropdown,
                 lang_box,
                 ctc_checkbox,
+                dual_audio_cb,
+                watermark_box,
             ],
             outputs=[
                 state_store,
@@ -1961,6 +2038,8 @@ def build_ui():
                     lines_radio,
                     vocal_intervals_box,
                     fx_intervals_box,
+                    dual_audio_cb,
+                    watermark_box,
                 ],
                 outputs=[
                     state_store,
@@ -2001,6 +2080,20 @@ def build_ui():
             fn=None,
             inputs=[studio_data_box],
             js=PUSH_TIMELINE_JSON_JS,
+        )
+
+        export_dj_btn.click(
+            fn=sync_timeline_boxes_ui,
+            inputs=[vocal_intervals_box, fx_intervals_box],
+            outputs=[vocal_intervals_box, fx_intervals_box],
+            js=SYNC_TIMELINE_TO_GRADIO_JS,
+            queue=False,
+        ).then(
+            fn=export_dj_pack_ui,
+            inputs=[state_store, editor_box, vocal_vol_slider, vocal_intervals_box],
+            outputs=[dj_pack_files, status_box],
+            concurrency_id="karaoke_generation",
+            concurrency_limit=1,
         )
 
         regroup_btn.click(

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useProjectStore } from '@/stores/project'
 import { usePlayerStore } from '@/stores/player'
 import {
@@ -18,15 +18,25 @@ const playerStore = usePlayerStore()
 const videoRef = ref<HTMLVideoElement | null>(null)
 const audioRef = ref<HTMLAudioElement | null>(null)
 const isMuted = ref(false)
+const mediaCacheBuster = ref(Date.now())
+const lastVocalMultiplier = ref(0.8)
+
+const hasVideoFile = computed(() => {
+  return Boolean(projectStore.currentProject?.has_video)
+})
 
 const videoUrl = computed(() => {
   if (!projectStore.currentProject?.title) return ''
-  return `/api/media/${encodeURIComponent(projectStore.currentProject.title)}/video?t=${Date.now()}`
+  const titleEnc = encodeURIComponent(projectStore.currentProject.title)
+  if (hasVideoFile.value) {
+    return `/api/media/${titleEnc}/video?t=${mediaCacheBuster.value}`
+  }
+  return `/api/media/${titleEnc}/instrumental?t=${mediaCacheBuster.value}`
 })
 
 const vocalsUrl = computed(() => {
   if (!projectStore.currentProject?.title) return ''
-  return `/api/media/${encodeURIComponent(projectStore.currentProject.title)}/vocals`
+  return `/api/media/${encodeURIComponent(projectStore.currentProject.title)}/vocals?t=${mediaCacheBuster.value}`
 })
 
 const coverUrl = computed(() => {
@@ -48,6 +58,10 @@ function handleTimeUpdate() {
   }
 }
 
+function handleLoadedMetadata() {
+  playerStore.bindMedia(videoRef.value, audioRef.value)
+}
+
 function handleVideoEnded() {
   playerStore.pause()
 }
@@ -55,6 +69,19 @@ function handleVideoEnded() {
 function toggleMute() {
   isMuted.value = !isMuted.value
   playerStore.setMasterVolume(isMuted.value ? 0 : 1.0)
+}
+
+function onVideoStageClick() {
+  playerStore.togglePlay()
+}
+
+function toggleLeadVocalQuick() {
+  if (playerStore.liveVocalMultiplier > 0) {
+    lastVocalMultiplier.value = playerStore.liveVocalMultiplier
+    playerStore.setLiveVocalMultiplier(0)
+  } else {
+    playerStore.setLiveVocalMultiplier(lastVocalMultiplier.value || 0.8)
+  }
 }
 
 function onMasterVolumeChange(e: Event) {
@@ -65,6 +92,9 @@ function onMasterVolumeChange(e: Event) {
 
 function onVocalMultiplierChange(e: Event) {
   const val = Number((e.target as HTMLInputElement).value) / 100
+  if (val > 0) {
+    lastVocalMultiplier.value = val
+  }
   playerStore.setLiveVocalMultiplier(val)
 }
 
@@ -95,6 +125,28 @@ watch(
   { immediate: true }
 )
 
+watch(
+  [() => projectStore.currentProject?.title, () => projectStore.currentProject?.has_video],
+  async ([newTitle, newHasVideo], [oldTitle, oldHasVideo]) => {
+    if (newTitle !== oldTitle || newHasVideo !== oldHasVideo) {
+      mediaCacheBuster.value = Date.now()
+      playerStore.resetForNewProject()
+      await nextTick()
+      if (videoRef.value) {
+        try {
+          videoRef.value.load()
+        } catch (_) {}
+      }
+      if (audioRef.value) {
+        try {
+          audioRef.value.load()
+        } catch (_) {}
+      }
+      playerStore.bindMedia(videoRef.value, audioRef.value)
+    }
+  }
+)
+
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
 })
@@ -108,22 +160,68 @@ onUnmounted(() => {
   <div class="flex-1 flex flex-col bg-studio-bg overflow-hidden min-h-0 border-r border-studio-border">
     <!-- Video Stage / Canvas Area -->
     <div class="flex-1 flex items-center justify-center p-3 relative overflow-hidden bg-black/60">
-      <div v-if="projectStore.hasProject" class="relative max-h-full max-w-full aspect-video flex items-center justify-center rounded-lg overflow-hidden shadow-2xl border border-studio-border/60 bg-black">
+      <div
+        v-if="projectStore.hasProject"
+        @click="onVideoStageClick"
+        class="relative w-full max-w-4xl max-h-full aspect-video flex items-center justify-center rounded-xl overflow-hidden shadow-2xl border border-slate-700/70 bg-slate-950 cursor-pointer group select-none"
+        title="Нажмите для воспроизведения / паузы (Пробел)"
+      >
         <video
           ref="videoRef"
           :src="videoUrl"
           :poster="coverUrl"
+          preload="auto"
+          @loadedmetadata="handleLoadedMetadata"
           @timeupdate="handleTimeUpdate"
           @ended="handleVideoEnded"
-          class="w-full h-full object-contain"
+          class="w-full h-full object-contain pointer-events-none"
           playsinline
         ></video>
 
-        <!-- Hidden dry vocal track synced with video -->
+        <!-- Hover Play/Pause Quick Action Badge -->
+        <div
+          class="absolute inset-0 flex items-center justify-center bg-black/15 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none"
+        >
+          <div class="w-14 h-14 rounded-full bg-slate-900/85 backdrop-blur-md border border-white/20 flex items-center justify-center shadow-2xl text-white transform group-hover:scale-105 transition-transform">
+            <Pause v-if="playerStore.isPlaying" class="w-6 h-6 fill-current" />
+            <Play v-else class="w-6 h-6 fill-current ml-0.5" />
+          </div>
+        </div>
+
+        <!-- Sleek Preview Card when MP4 is not rendered yet (Audio Stems only) -->
+        <div
+          v-if="!hasVideoFile"
+          class="absolute inset-0 flex flex-col items-center justify-center p-6 text-center select-none pointer-events-none overflow-hidden"
+        >
+          <img
+            :src="coverUrl"
+            alt=""
+            class="absolute inset-0 w-full h-full object-cover opacity-25 blur-2xl scale-110"
+          />
+          <div class="relative z-10 flex flex-col items-center max-w-md bg-slate-900/80 backdrop-blur-md border border-slate-700/80 rounded-2xl px-6 py-5 shadow-2xl">
+            <img
+              :src="coverUrl"
+              alt="Cover"
+              class="w-24 h-24 rounded-xl object-cover shadow-lg border border-white/10 mb-3"
+            />
+            <div class="text-sm font-semibold text-slate-100 truncate max-w-xs">
+              {{ projectStore.currentProject?.title }}
+            </div>
+            <span class="mt-1.5 inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+              Режим аудио-разметки (Stems готовы)
+            </span>
+            <p class="text-xs text-slate-400 mt-2 leading-relaxed">
+              Плеер воспроизводит инструментал и вокал напрямую. Нажмите <strong class="text-emerald-400">«Пересобрать MP4»</strong> сверху для рендера видео.
+            </p>
+          </div>
+        </div>
+
+        <!-- Synced dry vocal track -->
         <audio
           ref="audioRef"
           :src="vocalsUrl"
           preload="auto"
+          @loadedmetadata="handleLoadedMetadata"
         ></audio>
       </div>
 
@@ -178,22 +276,41 @@ onUnmounted(() => {
       </div>
 
       <!-- Right: Audio Mix Controls -->
-      <div class="flex items-center space-x-6">
+      <div class="flex items-center space-x-5">
         <!-- Live Vocal Multiplier (Practice Lead Vocals) -->
-        <div class="flex items-center space-x-2" title="Подмешивание оригинального голоса в динамики для разучивания (0% = чистый минус)">
-          <Mic2 class="w-4 h-4 text-emerald-400 shrink-0" />
-          <span class="text-xs text-slate-300 whitespace-nowrap">Лид-вокал:</span>
+        <div
+          class="flex items-center space-x-2"
+          title="Подмешивание оригинального голоса в динамики для разучивания (0% = чистый минус). Нажмите на иконку микрофона для быстрого включения/выключения."
+        >
+          <button
+            type="button"
+            @click="toggleLeadVocalQuick"
+            class="p-1 rounded transition-colors"
+            :class="playerStore.effectiveVocalMultiplier > 0 ? 'text-emerald-400 bg-emerald-500/15' : 'text-slate-400 hover:text-emerald-300'"
+            title="Вкл / Выкл лид-вокал"
+          >
+            <Mic2 class="w-4 h-4 shrink-0" />
+          </button>
+          <span
+            @click="toggleLeadVocalQuick"
+            class="text-xs text-slate-300 whitespace-nowrap cursor-pointer hover:text-white"
+          >
+            Лид-вокал:
+          </span>
           <input
             type="range"
             min="0"
             max="150"
             step="5"
-            :value="playerStore.liveVocalMultiplier * 100"
+            :value="Math.round(playerStore.liveVocalMultiplier * 100)"
             @input="onVocalMultiplierChange"
             class="w-24 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
           />
-          <span class="text-xs font-mono text-emerald-400 w-9 text-right">
-            {{ Math.round(playerStore.liveVocalMultiplier * 100) }}%
+          <span
+            class="text-xs font-mono w-10 text-right font-semibold"
+            :class="playerStore.effectiveVocalMultiplier > 0 ? 'text-emerald-400' : 'text-slate-500'"
+          >
+            {{ Math.round(playerStore.effectiveVocalMultiplier * 100) }}%
           </span>
         </div>
 
@@ -209,7 +326,7 @@ onUnmounted(() => {
             type="range"
             min="0"
             max="100"
-            :value="playerStore.masterVolume * 100"
+            :value="Math.round(playerStore.masterVolume * 100)"
             @input="onMasterVolumeChange"
             class="w-20 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
           />

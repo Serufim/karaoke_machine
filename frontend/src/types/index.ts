@@ -45,8 +45,12 @@ export interface ProjectState {
   editor_text: string
   has_video?: boolean
   cover_image?: string
+  cover_edge_colors?: Record<string, string>
+  custom_bg?: string
+  video_bg?: string
   no_vocals_wav?: string
   vocals_wav?: string
+  watermark_text?: string
 }
 
 export interface ProjectMeta {

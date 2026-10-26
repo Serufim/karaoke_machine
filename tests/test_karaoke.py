@@ -611,6 +611,157 @@ def test_youtube_downloader_opts_and_cookies_config(tmp_path: Path):
     print("✓ test_youtube_downloader_opts_and_cookies_config passed!")
 
 
+def test_pro_dj_exporters_and_dual_audio_mp4(tmp_path: Path):
+    """
+    Verifies all professional DJ / KJ formats:
+    1. Enhanced LRC (.lrc) with word-level <mm:ss.xx> tags
+    2. UltraStar (.txt) with FFT vocal pitch estimation (440 Hz -> MIDI 69 -> UltraStar 21)
+    3. KaraFun / EnCore! (.kfn) binary container with multi-track audio and song.ini
+    4. Classic MP3+G (.cdg.zip) with 24-byte CD+G subcode packets & XOR sweep
+    5. Full DJ Master Pack (.zip) and Dual-Audio 1080p MP4 with DJ Watermark
+    """
+    import zipfile
+    from karaoke.pro_exporter import (
+        export_enhanced_lrc,
+        export_ultrastar_txt,
+        export_kfn_package,
+        inspect_kfn_package,
+        export_cdg_zip,
+        export_dj_master_pack,
+        CDG_COMMAND,
+        CDG_INST_TILE_BLOCK,
+        CDG_INST_TILE_BLOCK_XOR,
+    )
+    from karaoke.media import probe_media
+    from karaoke.video import find_ffmpeg
+
+    sr = 44100
+    duration = 3.0
+    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+    inst = (0.2 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+    # 440 Hz vocal tone (A4 = MIDI 69 -> UltraStar relative pitch 21)
+    voc = (0.5 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+
+    inst_wav = tmp_path / "pro_inst.wav"
+    voc_wav = tmp_path / "pro_voc.wav"
+    sf.write(str(inst_wav), inst, sr)
+    sf.write(str(voc_wav), voc, sr)
+
+    lines = [
+        [
+            {"text": "Привет", "start": 0.50, "end": 1.10},
+            {"text": "диджей", "start": 1.15, "end": 1.80},
+        ],
+        [
+            {"text": "Караоке", "start": 1.90, "end": 2.60},
+        ],
+    ]
+
+    # 1. Enhanced LRC
+    lrc_file = tmp_path / "song.lrc"
+    export_enhanced_lrc(lines, lrc_file, title="Клубный Хит")
+    lrc_text = lrc_file.read_text(encoding="utf-8")
+    assert "[ti:Клубный Хит]" in lrc_text
+    assert "[00:00.50]<00:00.50>Привет <00:01.15>диджей<00:01.80>" in lrc_text
+
+    # 2. UltraStar TXT with pitch detection
+    us_file = tmp_path / "song_ultrastar.txt"
+    export_ultrastar_txt(lines, us_file, title="Клубный Хит", vocals_wav=voc_wav)
+    us_text = us_file.read_text(encoding="utf-8")
+    assert "#TITLE:Клубный Хит" in us_text
+    assert "#BPM:300" in us_text
+    # Check that pitch near 21 (440 Hz) was detected on 'Привет'
+    assert ": 10 12 21 Привет " in us_text
+    assert us_text.strip().endswith("E")
+
+    # 3. KaraFun / EnCore! KFN binary container
+    kfn_file = tmp_path / "song.kfn"
+    export_kfn_package(
+        lines=lines,
+        instrumental_wav=inst_wav,
+        output_path=kfn_file,
+        title="Клубный Хит",
+        vocals_wav=voc_wav,
+    )
+    assert kfn_file.exists() and kfn_file.stat().st_size > 2048
+    kfn_info = inspect_kfn_package(kfn_file)
+    file_names = [f["name"] for f in kfn_info["files"]]
+    assert "instrumental.mp3" in file_names
+    assert "vocals.mp3" in file_names
+    assert "cover.jpg" in file_names
+    assert "song.ini" in file_names
+    assert all(f["size_valid"] for f in kfn_info["files"])
+    assert "Title=Клубный Хит" in kfn_info["song_ini"]
+    assert "Track0=1,0,0,V,vocals.mp3" in kfn_info["song_ini"]
+    assert "Привет/ диджей" in kfn_info["song_ini"]
+
+    # 4. Classic CD+G (MP3+G) ZIP
+    cdg_zip = tmp_path / "song_cdg.zip"
+    export_cdg_zip(lines, inst_wav, cdg_zip, title="Club_Hit")
+    assert cdg_zip.exists()
+    with zipfile.ZipFile(cdg_zip, "r") as zf:
+        z_names = zf.namelist()
+        assert "Club_Hit.mp3" in z_names
+        assert "Club_Hit.cdg" in z_names
+        cdg_bytes = zf.read("Club_Hit.cdg")
+        assert len(cdg_bytes) % 24 == 0
+        instructions = [
+            cdg_bytes[i + 1] & 0x3F
+            for i in range(0, len(cdg_bytes), 24)
+            if cdg_bytes[i] == CDG_COMMAND
+        ]
+        assert CDG_INST_TILE_BLOCK in instructions
+        assert CDG_INST_TILE_BLOCK_XOR in instructions
+
+    # 5. Full DJ Master Pack & Dual-Audio MP4 with DJ Watermark
+    state_data = {
+        "title": "dj_test_track",
+        "vocals_wav": str(voc_wav),
+        "no_vocals_wav": str(inst_wav),
+        "lines": lines,
+        "editor_text": lines_to_editor_text(lines),
+        "duration": duration,
+        "vocal_intervals": [],
+        "fx_intervals": [],
+    }
+    dj_zip, dj_kfn = export_dj_master_pack(state_data, tmp_path)
+    assert dj_zip.exists() and dj_kfn.exists()
+    with zipfile.ZipFile(dj_zip, "r") as zf:
+        pack_files = set(zf.namelist())
+        assert "dj_test_track.kfn" in pack_files
+        assert "dj_test_track_cdg.zip" in pack_files
+        assert "dj_test_track.lrc" in pack_files
+        assert "dj_test_track_ultrastar.txt" in pack_files
+        assert "dj_test_track_instrumental.mp3" in pack_files
+        assert "dj_test_track_vocals.mp3" in pack_files
+
+    ass_wm = tmp_path / "wm.ass"
+    generate_ass_from_lines(
+        lines,
+        ass_wm,
+        title="DJ Watermark Test",
+        watermark_text="🎤 Karaoke by DJ Alex | @djalex",
+    )
+    ass_wm_text = ass_wm.read_text(encoding="utf-8")
+    assert "Style: DJWatermark" in ass_wm_text
+    assert "Karaoke by DJ Alex | @djalex" in ass_wm_text
+
+    dual_mp4 = tmp_path / "dual_audio.mp4"
+    render_karaoke_video(
+        instrumental_audio=inst_wav,
+        ass_subtitles=ass_wm,
+        output_video=dual_mp4,
+        guide_vocal_audio=voc_wav,
+        fps=15,
+        video_quality="light",
+    )
+    assert dual_mp4.exists()
+    meta = probe_media(dual_mp4, find_ffmpeg())
+    audio_streams = [s for s in meta.get("streams", []) if s.get("codec_type") == "audio"]
+    assert len(audio_streams) == 2, f"Expected 2 audio streams in Dual-Audio MP4, got {len(audio_streams)}"
+    print("✓ test_pro_dj_exporters_and_dual_audio_mp4 passed!")
+
+
 if __name__ == "__main__":
     test_dir = Path("/tmp/karaoke_tests_v3_2")
     test_dir.mkdir(parents=True, exist_ok=True)
@@ -628,4 +779,5 @@ if __name__ == "__main__":
     test_non_16_9_background_centering(test_dir)
     test_audio_from_source_video_bg_flag(test_dir)
     test_youtube_downloader_opts_and_cookies_config(test_dir)
-    print("\n🎉 ALL TESTS (POLICE STROBE, NEON SPARKLES, SMART BG, YOUTUBE COOKIES & VIDEO UPLOAD) PASSED SUCCESSFULLY!")
+    test_pro_dj_exporters_and_dual_audio_mp4(test_dir)
+    print("\n🎉 ALL TESTS (INCLUDING PRO DJ EXPORTERS & DUAL-AUDIO MP4) PASSED SUCCESSFULLY!")

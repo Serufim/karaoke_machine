@@ -168,3 +168,26 @@ def mix_guide_vocals(
     sf.write(str(output_path), mixed, sr_inst)
     print(f"[Karaoke] Mixed backing track saved to: {output_path}")
     return output_path
+
+
+def ensure_full_guide_mix(
+    instrumental_path: Path,
+    vocals_path: Path,
+    output_path: Path,
+) -> Path:
+    """
+    Creates or reuses a 100% full-vocal guide mix (Instrumental + 100% Vocals)
+    used as the second switchable audio stream in Dual-Audio MP4 files for KJs/DJs.
+    """
+    if not vocals_path.exists():
+        return instrumental_path
+    if output_path.exists() and output_path.stat().st_size > 1024:
+        return output_path
+    return mix_guide_vocals(
+        instrumental_path=instrumental_path,
+        vocals_path=vocals_path,
+        output_path=output_path,
+        vocal_volume=1.0,
+        vocal_intervals=None,
+    )
+

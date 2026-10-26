@@ -271,6 +271,13 @@ export const useProjectStore = defineStore('project', () => {
         const err = await res.json()
         throw new Error(err.detail || 'Ошибка загрузки обложки')
       }
+      const data = await res.json()
+      if (data.cover_image) {
+        currentProject.value.cover_image = data.cover_image
+      }
+      if (data.cover_edge_colors) {
+        currentProject.value.cover_edge_colors = data.cover_edge_colors
+      }
       coverTimestamp.value = Date.now()
       isDirty.value = true
     } catch (e: any) {
@@ -292,6 +299,10 @@ export const useProjectStore = defineStore('project', () => {
       if (!res.ok) {
         const err = await res.json()
         throw new Error(err.detail || 'Ошибка загрузки фона')
+      }
+      const data = await res.json()
+      if (data.bg_path) {
+        currentProject.value.custom_bg = data.bg_path
       }
       isDirty.value = true
     } catch (e: any) {

@@ -80,6 +80,14 @@ class RebuildRequest(BaseModel):
     edge_color_mode: str = "cyberpunk"
     font_size_mode: str = "large"
     highlight_color: str = "gold_neon"
+    dual_audio_mp4: bool = True
+    watermark_text: Optional[str] = None
+
+
+class DjExportRequest(BaseModel):
+    editor_text: Optional[str] = None
+    vocal_volume: float = 0.0
+    vocal_intervals: Optional[List[Dict[str, Any]]] = None
 
 
 class UpdateStateRequest(BaseModel):
@@ -276,6 +284,7 @@ async def upload_cover_image(title: str, file: UploadFile = File(...)) -> Dict[s
     return {
         "status": "ok",
         "cover_url": f"/api/media/{title}/cover?t={int(time.time() * 1000)}",
+        "cover_image": str(cover_path),
         "cover_edge_colors": cover_edge_colors,
     }
 
@@ -510,6 +519,8 @@ def _run_rebuild_task(
     edge_color_mode: str,
     font_size_mode: str,
     highlight_color: str,
+    dual_audio_mp4: bool = True,
+    watermark_text: Optional[str] = None,
 ):
     reset_cancel()
 
@@ -523,8 +534,25 @@ def _run_rebuild_task(
 
     try:
         update_progress("Пересборка видео из сохраненного состояния...", 0.10)
-        custom_bg = state_data.get("custom_bg")
-        bg_param = Path(custom_bg) if custom_bg and Path(custom_bg).exists() else None
+
+        # Background resolution logic:
+        # If use_cover_bg is requested, background must be None so create_cover_background
+        # and album art card overlay are active (never overridden by lingering custom_bg).
+        if use_cover_bg:
+            bg_param = None
+        elif use_video_bg and state_data.get("video_bg") and Path(state_data["video_bg"]).exists():
+            bg_param = Path(state_data["video_bg"])
+        else:
+            custom_bg = state_data.get("custom_bg")
+            bg_param = Path(custom_bg) if custom_bg and Path(custom_bg).exists() else None
+
+        # Ensure cover art exists for cover mode
+        cover_img_path = state_data.get("cover_image")
+        if not cover_img_path or not Path(cover_img_path).exists():
+            resolved_cover = ensure_project_cover(title, WORK_DIR)
+            if resolved_cover and resolved_cover.exists():
+                state_data["cover_image"] = str(resolved_cover)
+                state_data["cover_edge_colors"] = extract_cover_edge_colors(resolved_cover)
 
         final_video, _mixed_audio, updated_editor_text = render_from_state(
             state_data=state_data,
@@ -543,8 +571,17 @@ def _run_rebuild_task(
             font_size_mode=font_size_mode,
             highlight_color=highlight_color,
             video_quality=video_quality,
+            dual_audio_mp4=dual_audio_mp4,
+            watermark_text=watermark_text,
             progress_callback=update_progress,
         )
+
+        # Persist final state back to disk so reloading on frontend never loses fx_intervals or vocal_intervals
+        state_data["editor_text"] = updated_editor_text
+        state_data["lines"] = editor_text_to_lines(updated_editor_text, original_lines=state_data.get("lines", []))
+        state_data["has_video"] = True
+        state_file = WORK_DIR / f"{title}_state.json"
+        state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
         ws_manager.broadcast_threadsafe({
             "type": "completed",
@@ -573,6 +610,31 @@ def start_rebuild(payload: RebuildRequest) -> Dict[str, Any]:
 
     state_data = json.loads(state_file.read_text(encoding="utf-8"))
 
+    # Immediately synchronize all timeline and modal parameters into state_data
+    if payload.fx_intervals is not None:
+        state_data["fx_intervals"] = payload.fx_intervals
+    if payload.vocal_intervals is not None:
+        state_data["vocal_intervals"] = payload.vocal_intervals
+    if payload.emoji_intervals is not None:
+        state_data["emoji_intervals"] = payload.emoji_intervals
+    if payload.editor_text is not None:
+        state_data["editor_text"] = payload.editor_text
+        state_data["lines"] = editor_text_to_lines(payload.editor_text, original_lines=state_data.get("lines", []))
+    state_data["num_lines"] = payload.num_lines
+    state_data["video_quality"] = payload.video_quality
+    state_data["visual_effects"] = payload.visual_effects
+    state_data["edge_color_mode"] = payload.edge_color_mode
+    state_data["font_size_mode"] = payload.font_size_mode
+    state_data["highlight_color"] = payload.highlight_color
+    state_data["dual_audio_mp4"] = payload.dual_audio_mp4
+    state_data["use_cover_bg"] = payload.use_cover_bg
+    state_data["use_video_bg"] = payload.use_video_bg
+    if payload.watermark_text is not None:
+        state_data["watermark_text"] = payload.watermark_text
+
+    # Write to disk before kicking off thread
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
     t = threading.Thread(
         target=_run_rebuild_task,
         args=(
@@ -591,11 +653,64 @@ def start_rebuild(payload: RebuildRequest) -> Dict[str, Any]:
             payload.edge_color_mode,
             payload.font_size_mode,
             payload.highlight_color,
+            payload.dual_audio_mp4,
+            payload.watermark_text,
         ),
         daemon=True,
     )
     t.start()
     return {"status": "started", "title": payload.title}
+
+
+@router.post("/projects/{title}/export-dj-pack")
+def build_project_dj_pack(title: str, payload: DjExportRequest) -> Dict[str, Any]:
+    """Builds the professional DJ Master Pack (.zip) and KaraFun/EnCore (.kfn) file on demand."""
+    state_file = WORK_DIR / f"{title}_state.json"
+    if not state_file.exists():
+        raise HTTPException(status_code=404, detail=f"Проект '{title}' не найден.")
+
+    from karaoke.pro_exporter import export_dj_master_pack
+
+    state_data = json.loads(state_file.read_text(encoding="utf-8"))
+    dj_zip_path, kfn_path = export_dj_master_pack(
+        state_data=state_data,
+        output_dir=OUTPUT_DIR,
+        editor_text=payload.editor_text or state_data.get("editor_text"),
+        vocal_volume=payload.vocal_volume,
+        vocal_intervals=payload.vocal_intervals if payload.vocal_intervals is not None else state_data.get("vocal_intervals"),
+    )
+    return {
+        "status": "ok",
+        "title": title,
+        "dj_pack_url": f"/api/media/{title}/dj-pack",
+        "kfn_url": f"/api/media/{title}/kfn",
+        "dj_pack_filename": dj_zip_path.name,
+        "kfn_filename": kfn_path.name,
+    }
+
+
+@router.get("/media/{title}/dj-pack")
+def download_dj_pack(title: str):
+    zip_path = OUTPUT_DIR / f"{title}_DJ_Pack.zip"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="DJ-пак еще не собран.")
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=zip_path.name,
+    )
+
+
+@router.get("/media/{title}/kfn")
+def download_kfn_file(title: str):
+    kfn_path = OUTPUT_DIR / f"{title}.kfn"
+    if not kfn_path.exists():
+        raise HTTPException(status_code=404, detail="KFN-файл еще не собран.")
+    return FileResponse(
+        kfn_path,
+        media_type="application/octet-stream",
+        filename=kfn_path.name,
+    )
 
 
 # Media streaming routes with range request support
@@ -654,5 +769,9 @@ def get_cover_image(title: str):
         p = state_data.get("cover_image")
         if p and Path(p).exists():
             return FileResponse(Path(p), media_type="image/png")
+
+    default_bg = OUTPUT_DIR / "default_bg.png"
+    if default_bg.exists():
+        return FileResponse(default_bg, media_type="image/png")
 
     raise HTTPException(status_code=404, detail="Обложка не найдена.")
