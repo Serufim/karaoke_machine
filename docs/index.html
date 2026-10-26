@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark scroll-smooth">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Karaoke Studio — Студийное караоке из любого трека за 2 минуты</title>
+  <meta name="description" content="Полностью локальная нейросеть для Windows и macOS. Вырезает вокал в 4x качестве (Demucs), синхронизирует русские песни по слогам (Whisper + Wav2Vec2) и добавляет неоновые спецэффекты. Без подписок." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            studio: {
+              bg: '#090d16',
+              panel: '#0f172a',
+              surface: '#1e293b',
+              border: '#334155',
+              accent: '#0284c7',
+              vocal: '#10b981',
+              inst: '#f59e0b',
+              fx: '#8b5cf6',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap');
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #090d16;
+      color: #f8fafc;
+    }
+    .font-mono { font-family: 'JetBrains Mono', monospace; }
+    .glow-sky { box-shadow: 0 0 35px -5px rgba(14, 165, 233, 0.35); }
+    .glow-gold { text-shadow: 0 0 18px rgba(251, 191, 36, 0.85), 0 0 32px rgba(245, 158, 11, 0.5); }
+    .glow-cyber { text-shadow: 0 0 18px rgba(56, 189, 248, 0.9), 0 0 35px rgba(139, 92, 246, 0.7); }
+    .glow-pink { text-shadow: 0 0 18px rgba(244, 63, 94, 0.9), 0 0 35px rgba(236, 72, 153, 0.7); }
+    @keyframes floatEmoji {
+      0% { transform: translateY(0) scale(0.6) rotate(0deg); opacity: 1; }
+      100% { transform: translateY(-90px) scale(1.35) rotate(18deg); opacity: 0; }
+    }
+    .emoji-particle {
+      animation: floatEmoji 1.6s ease-out forwards;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body class="min-h-screen selection:bg-sky-500 selection:text-white overflow-x-hidden">
+
+  <!-- Sticky Navbar -->
+  <header class="sticky top-0 z-40 backdrop-blur-xl bg-[#090d16]/85 border-b border-slate-800/80">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
+      <a href="#" class="flex items-center space-x-2.5">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-500/20">
+          <span class="text-lg">🎤</span>
+        </div>
+        <div>
+          <span class="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-sky-200 to-indigo-300 bg-clip-text text-transparent">
+            AI Karaoke Studio
+          </span>
+          <span class="ml-2 px-2 py-0.5 text-[10px] font-mono uppercase bg-sky-500/15 text-sky-400 border border-sky-500/30 rounded-full">
+            v0.3 Desktop
+          </span>
+        </div>
+      </a>
+
+      <nav class="hidden md:flex items-center space-x-7 text-sm text-slate-300 font-medium">
+        <a href="#demo" class="hover:text-white transition">Живое демо</a>
+        <a href="#features" class="hover:text-white transition">Технологии</a>
+        <a href="#hardware" class="hover:text-white transition">Потянет ли ПК?</a>
+        <a href="#pricing" class="hover:text-white transition">Цены и Beta</a>
+        <a href="#faq" class="hover:text-white transition">FAQ</a>
+      </nav>
+
+      <div class="flex items-center space-x-3">
+        <a
+          href="https://github.com/Serufim/karaoke_machine/releases"
+          target="_blank"
+          class="hidden sm:inline-flex items-center px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+        >
+          Скачать Beta
+        </a>
+        <button
+          onclick="openWaitlistModal('Early Bird ($7 / 690 ₽)')"
+          class="inline-flex items-center px-4 py-2 rounded-lg text-xs font-bold bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white shadow-lg shadow-sky-500/25 transition"
+        >
+          Предзаказ -50%
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Section -->
+  <section class="relative pt-14 pb-20 md:pt-20 md:pb-28 px-4 sm:px-6 overflow-hidden">
+    <div class="absolute -top-40 left-1/2 -translate-x-1/2 w-[750px] h-[400px] bg-sky-500/15 blur-[130px] rounded-full pointer-events-none"></div>
+    <div class="max-w-7xl mx-auto text-center relative z-10">
+      <div class="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full bg-slate-900/90 border border-slate-700/80 text-xs text-sky-300 mb-6">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span>Готовится к выходу в Steam &bull; Открыт закрытый бета-тест для Windows и macOS</span>
+      </div>
+
+      <h1 class="text-4xl sm:text-6xl font-black tracking-tight max-w-4xl mx-auto leading-[1.12]">
+        Преврати любой трек или YouTube-клип в
+        <span class="bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">
+          студийное караоке
+        </span>
+        за 2 минуты
+      </h1>
+
+      <p class="mt-6 text-base sm:text-lg text-slate-400 max-w-2xl mx-auto leading-relaxed">
+        Полностью локальная программа на твоей видеокарте. Вырезает вокал в 4x качестве (<b>Demucs</b>),
+        синхронизирует русский текст по слогам (<b>Whisper Turbo + Wav2Vec2</b>) и рендерит 60 FPS видео
+        с неоновыми эффектами. <b>Без облачных подписок и очередей.</b>
+      </p>
+
+      <!-- Hero CTA Buttons -->
+      <div class="mt-8 flex flex-col sm:flex-row items-center justify-center gap-4">
+        <button
+          onclick="openWaitlistModal('Early Bird ($7 / 690 ₽)')"
+          class="w-full sm:w-auto px-7 py-4 rounded-xl font-bold text-sm bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white glow-sky transition transform hover:-translate-y-0.5"
+        >
+          🔥 Забронировать Pro со скидкой 50% (690 ₽ / $7)
+        </button>
+        <a
+          href="https://github.com/Serufim/karaoke_machine/releases"
+          target="_blank"
+          class="w-full sm:w-auto px-7 py-4 rounded-xl font-semibold text-sm bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 transition flex items-center justify-center space-x-2"
+        >
+          <span>💻 Скачать бесплатную Beta (Win / Mac)</span>
+        </a>
+      </div>
+
+      <div class="mt-4 text-xs text-slate-500 flex items-center justify-center space-x-4">
+        <span>✓ Разовая покупка навсегда</span>
+        <span>&bull;</span>
+        <span>✓ NVIDIA CUDA / Apple Silicon / CPU</span>
+        <span>&bull;</span>
+        <span>✓ Ключ в Steam в комплекте</span>
+      </div>
+    </div>
+
+    <!-- Interactive Studio Simulator -->
+    <div id="demo" class="max-w-5xl mx-auto mt-14 relative z-10">
+      <div class="rounded-2xl bg-studio-panel border border-slate-700/80 shadow-2xl overflow-hidden">
+        <!-- Fake Window Titlebar -->
+        <div class="px-4 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between text-xs">
+          <div class="flex items-center space-x-2">
+            <span class="w-3 h-3 rounded-full bg-rose-500/80"></span>
+            <span class="w-3 h-3 rounded-full bg-amber-500/80"></span>
+            <span class="w-3 h-3 rounded-full bg-emerald-500/80"></span>
+            <span class="ml-2 font-semibold text-slate-300">AI Karaoke Studio — Интерактивное демо прямо в браузере</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-mono text-[11px]">GPU: CUDA / Metal Ready</span>
+          </div>
+        </div>
+
+        <!-- Interactive Controls Bar -->
+        <div class="p-3 sm:px-5 bg-slate-900/60 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div class="flex items-center space-x-2">
+            <span class="text-slate-400">Стиль неона:</span>
+            <button onclick="setHighlightStyle('gold')" id="btn-style-gold" class="px-2.5 py-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-medium">Золотой неон</button>
+            <button onclick="setHighlightStyle('cyber')" id="btn-style-cyber" class="px-2.5 py-1 rounded bg-slate-800 text-slate-300 border border-slate-700 font-medium">Киберпанк</button>
+            <button onclick="setHighlightStyle('pink')" id="btn-style-pink" class="px-2.5 py-1 rounded bg-slate-800 text-slate-300 border border-slate-700 font-medium">Розовый импульс</button>
+          </div>
+
+          <div class="flex items-center space-x-2">
+            <span class="text-slate-400">Режим вокала:</span>
+            <button onclick="setVocalMode('minus')" id="btn-voc-minus" class="px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-medium">0% (Чистый минус)</button>
+            <button onclick="setVocalMode('guide')" id="btn-voc-guide" class="px-2.5 py-1 rounded bg-slate-800 text-slate-300 border border-slate-700 font-medium">30% (Подпевка в припеве)</button>
+            <button onclick="triggerEmojiBurst()" class="px-3 py-1 rounded bg-purple-600/30 hover:bg-purple-600/50 text-purple-200 border border-purple-500/40 font-semibold transition">
+              💥 Взрыв эмодзи
+            </button>
+          </div>
+        </div>
+
+        <!-- Stage Canvas Preview -->
+        <div id="stage-container" class="relative h-64 sm:h-80 bg-gradient-to-br from-[#0c1222] via-[#131b31] to-[#1e1136] flex flex-col items-center justify-center p-6 select-none overflow-hidden">
+          <div id="emoji-layer" class="absolute inset-0 pointer-events-none overflow-hidden"></div>
+
+          <div class="text-[11px] uppercase tracking-widest text-sky-400/80 font-mono mb-3" id="vocal-status-badge">
+            🎵 ИГРАЕТ ЧИСТЫЙ ИНСТРУМЕНТАЛ (DEMUCS 4X) • 60 FPS
+          </div>
+
+          <!-- Active Karaoke Line -->
+          <div id="karaoke-active-line" class="text-2xl sm:text-4xl font-black text-center tracking-wide transition-all duration-150">
+          </div>
+
+          <!-- Next Karaoke Line -->
+          <div id="karaoke-next-line" class="mt-4 text-base sm:text-xl font-semibold text-slate-400/70 text-center">
+          </div>
+        </div>
+
+        <!-- Simulated Multi-Track Timeline -->
+        <div class="p-4 bg-[#090d16] border-t border-slate-800 space-y-2 text-[11px] font-mono">
+          <div class="flex items-center justify-between text-slate-400 mb-1">
+            <span>ТАЙМЛАЙН ПРОЕКТА (РЕДАКТИРУЕМЫЕ ДОРОЖКИ)</span>
+            <span id="sim-timecode" class="text-sky-400">00:14.20 / 03:12.00</span>
+          </div>
+          <!-- Track 1: Lyrics -->
+          <div class="h-7 rounded bg-slate-900 border border-slate-800 flex items-center px-2 space-x-2 overflow-hidden">
+            <span class="text-sky-400 w-24 shrink-0">1. СЛОВА:</span>
+            <div class="flex-1 flex space-x-1.5">
+              <div class="px-2 py-0.5 rounded bg-sky-500/20 border border-sky-500/40 text-sky-200 truncate">[00:12.00] Город спит в огнях</div>
+              <div class="px-2 py-0.5 rounded bg-sky-500/30 border border-sky-400 text-white truncate">[00:14.50] Мы взлетаем вверх</div>
+              <div class="px-2 py-0.5 rounded bg-slate-800 text-slate-400 truncate">[00:17.10] Музыка внутри нас</div>
+            </div>
+          </div>
+          <!-- Track 2: Guide Vocal -->
+          <div class="h-7 rounded bg-slate-900 border border-slate-800 flex items-center px-2 space-x-2 overflow-hidden">
+            <span class="text-emerald-400 w-24 shrink-0">2. ВОКАЛ:</span>
+            <div class="flex-1 flex items-center space-x-2">
+              <div class="w-1/3 h-4 rounded bg-slate-800/60 flex items-center justify-center text-[10px] text-slate-500">0% (Куплет — тишина)</div>
+              <div class="w-1/3 h-4 rounded bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-[10px] text-emerald-300">35% Подпевка на припеве</div>
+              <div class="w-1/3 h-4 rounded bg-slate-800/60 flex items-center justify-center text-[10px] text-slate-500">0% (Минус)</div>
+            </div>
+          </div>
+          <!-- Track 3: FX & Emoji -->
+          <div class="h-7 rounded bg-slate-900 border border-slate-800 flex items-center px-2 space-x-2 overflow-hidden">
+            <span class="text-purple-400 w-24 shrink-0">3. ЭФФЕКТЫ:</span>
+            <div class="flex-1 flex items-center space-x-2">
+              <div class="w-1/4 h-4"></div>
+              <div class="w-2/4 h-4 rounded bg-purple-500/20 border border-purple-500/40 flex items-center justify-center text-[10px] text-purple-300">⚡ Авто-Дроп: Неоновый пульс + 🔥🎉🚀</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Problem vs Solution -->
+  <section class="py-16 px-4 sm:px-6 border-y border-slate-800/80 bg-slate-950/40">
+    <div class="max-w-6xl mx-auto grid md:grid-cols-2 gap-6">
+      <div class="p-6 rounded-2xl bg-rose-950/15 border border-rose-900/40 space-y-3">
+        <div class="text-xs font-bold uppercase tracking-wider text-rose-400">❌ Облачные онлайн-сервисы</div>
+        <h3 class="text-xl font-bold text-white">Дорого, кривой русский язык и очереди</h3>
+        <ul class="space-y-2 text-sm text-slate-400">
+          <li>• Просят <b>$15–$30 каждый месяц</b> за подписку или продают «минуты».</li>
+          <li>• Плохо понимают русский текст, сленг и быструю читку — слова съезжают на 2–3 секунды.</li>
+          <li>• Нельзя гибко отредактировать таймлайн, вернуть бэк-вокал только в припеве или настроить спецэффекты.</li>
+        </ul>
+      </div>
+
+      <div class="p-6 rounded-2xl bg-emerald-950/15 border border-emerald-800/40 space-y-3">
+        <div class="text-xs font-bold uppercase tracking-wider text-emerald-400">✅ AI Karaoke Studio (Нативный софт)</div>
+        <h3 class="text-xl font-bold text-white">Заплатил один раз — делаешь тысячи треков за 0 ₽</h3>
+        <ul class="space-y-2 text-sm text-slate-300">
+          <li>• Работает <b>на 100% локально</b> на твоём ПК или Mac. Полная приватность и безлимит.</li>
+          <li>• Специальный русский пайплайн: <b>Whisper Turbo + фонетический Wav2Vec2 CTC</b> выравнивают каждый слог по волне вокала.</li>
+          <li>• Полноценный редактор дорожек: правь текст, двигай фразы мышкой и пересобирай MP4 за 10 секунд без повторного прогона нейросетей.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Bento Features Section -->
+  <section id="features" class="py-20 px-4 sm:px-6 max-w-7xl mx-auto">
+    <div class="text-center max-w-3xl mx-auto mb-14">
+      <h2 class="text-3xl sm:text-4xl font-extrabold">Всё, что нужно для идеального караоке</h2>
+      <p class="mt-3 text-slate-400 text-sm sm:text-base">
+        От домашней вечеринки с друзьями до профессиональной работы диджеев, ведущих и караоке-клубов.
+      </p>
+    </div>
+
+    <div class="grid md:grid-cols-3 gap-6">
+      <div class="p-6 rounded-2xl bg-studio-panel border border-slate-800 hover:border-sky-500/50 transition">
+        <div class="text-2xl mb-3">🎚️</div>
+        <h3 class="text-lg font-bold text-white">Чистый минус (Demucs v4)</h3>
+        <p class="mt-2 text-sm text-slate-400 leading-relaxed">
+          4-кратный нейросетевой ансамбль отделяет вокал от ударных, баса и синтезаторов без «жеваного» звука. Можно оставить 20–30% голоса на сложных куплетах.
+        </p>
+      </div>
+
+      <div class="p-6 rounded-2xl bg-studio-panel border border-slate-800 hover:border-sky-500/50 transition">
+        <div class="text-2xl mb-3">🇷🇺</div>
+        <h3 class="text-lg font-bold text-white">Русский синхрон по слогам</h3>
+        <p class="mt-2 text-sm text-slate-400 leading-relaxed">
+          Можно загрузить эталонный текст песни из интернета — алгоритм сам привяжет каждое слово и слог к реальной атаке голоса певца с точностью до миллисекунд.
+        </p>
+      </div>
+
+      <div class="p-6 rounded-2xl bg-studio-panel border border-slate-800 hover:border-sky-500/50 transition">
+        <div class="text-2xl mb-3">⚡</div>
+        <h3 class="text-lg font-bold text-white">Умный авто-припев и неон</h3>
+        <p class="mt-2 text-sm text-slate-400 leading-relaxed">
+          Анализатор энергии аудио сам находит дропы и припевы, включая неоновую пульсацию текста, градиентную рамку под цвет обложки и салют из Apple Emoji.
+        </p>
+      </div>
+
+      <div class="p-6 rounded-2xl bg-studio-panel border border-slate-800 hover:border-sky-500/50 transition">
+        <div class="text-2xl mb-3">📺</div>
+        <h3 class="text-lg font-bold text-white">Импорт с YouTube в 1 клик</h3>
+        <p class="mt-2 text-sm text-slate-400 leading-relaxed">
+          Просто вставь ссылку на YouTube-клип. Программа сама скачает аудио в максимальном качестве, вытащит обложку или оставит оригинальный видеоклип на фоне.
+        </p>
+      </div>
+
+      <div class="p-6 rounded-2xl bg-studio-panel border border-slate-800 hover:border-sky-500/50 transition">
+        <div class="text-2xl mb-3">🎛️</div>
+        <h3 class="text-lg font-bold text-white">Мгновенная пересборка</h3>
+        <p class="mt-2 text-sm text-slate-400 leading-relaxed">
+          Заметил опечатку в слове или хочешь сменить цвет подсветки? Не нужно ждать нейросеть заново — пересборка готового видео из сохранённого проекта занимает 5–10 секунд.
+        </p>
+      </div>
+
+      <div class="p-6 rounded-2xl bg-studio-panel border border-slate-800 hover:border-sky-500/50 transition">
+        <div class="text-2xl mb-3">🧠</div>
+        <h3 class="text-lg font-bold text-white">Встроенный менеджер моделей</h3>
+        <p class="mt-2 text-sm text-slate-400 leading-relaxed">
+          Программа сама определяет твою видеокарту (CUDA / Metal / CPU), показывает сколько памяти нужно каждой модели и скачивает их в изолированный кэш в 1 клик.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Interactive Hardware Calculator -->
+  <section id="hardware" class="py-16 px-4 sm:px-6 bg-slate-950/60 border-y border-slate-800/80">
+    <div class="max-w-4xl mx-auto">
+      <div class="text-center mb-10">
+        <span class="px-3 py-1 rounded-full text-xs font-mono uppercase bg-sky-500/15 text-sky-400 border border-sky-500/30">Проверка совместимости</span>
+        <h2 class="mt-3 text-2xl sm:text-3xl font-extrabold">Потянет ли твой компьютер или ноутбук?</h2>
+        <p class="mt-2 text-sm text-slate-400">Выбери свою конфигурацию и посмотри реальное время генерации 3-минутной песни:</p>
+      </div>
+
+      <div class="p-6 sm:p-8 rounded-2xl bg-studio-panel border border-slate-700/80 shadow-xl space-y-6">
+        <div>
+          <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Выбери свою видеокарту / устройство:</label>
+          <select
+            id="gpu-selector"
+            onchange="updateGpuEstimate()"
+            class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-sky-500"
+          >
+            <option value="rtx_high">NVIDIA RTX 3060 / 3070 / 4060 / 4070 / 4080 (8–16 GB VRAM)</option>
+            <option value="rtx_mid">NVIDIA GTX 1650 / 1660 / RTX 2060 / 3050 (4–6 GB VRAM)</option>
+            <option value="mac_silicon">Apple MacBook Air / Pro / Mac Mini (M1 / M2 / M3 / M4)</option>
+            <option value="cpu_only">Ноутбук без видеокарты / Встроенная графика Intel или AMD (Режим CPU)</option>
+          </select>
+        </div>
+
+        <div class="grid sm:grid-cols-3 gap-4 pt-2">
+          <div class="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+            <div class="text-xs text-slate-400">Время на 1 песню (3 мин)</div>
+            <div id="hw-time" class="mt-1 text-xl font-black text-emerald-400">~35–50 секунд</div>
+          </div>
+          <div class="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+            <div class="text-xs text-slate-400">Рекомендуемый пресет</div>
+            <div id="hw-preset" class="mt-1 text-sm font-bold text-sky-300">Whisper Large-v3 Turbo + Demucs FT</div>
+          </div>
+          <div class="p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+            <div class="text-xs text-slate-400">Статус совместимости</div>
+            <div id="hw-status" class="mt-1 text-sm font-bold text-white">✅ Идеально (Ускорение CUDA)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Pricing & Fake Door Pre-order Section -->
+  <section id="pricing" class="py-20 px-4 sm:px-6 max-w-7xl mx-auto">
+    <div class="text-center max-w-3xl mx-auto mb-14">
+      <h2 class="text-3xl sm:text-4xl font-extrabold">Прозрачные цены без подписок</h2>
+      <p class="mt-3 text-slate-400 text-sm sm:text-base">
+        Проверь работу бесплатно на своём ПК прямо сейчас или забронируй полную версию со скидкой 50% до выхода в Steam.
+      </p>
+    </div>
+
+    <div class="grid md:grid-cols-3 gap-6 items-stretch">
+      <!-- Tier 1: Free Beta / Demo -->
+      <div class="p-7 rounded-2xl bg-studio-panel border border-slate-800 flex flex-col justify-between">
+        <div>
+          <div class="text-xs font-mono uppercase text-slate-400">Бесплатный тест железа</div>
+          <h3 class="mt-2 text-2xl font-bold text-white">Demo / Beta</h3>
+          <div class="mt-4 flex items-baseline space-x-2">
+            <span class="text-4xl font-black text-white">0 ₽</span>
+            <span class="text-xs text-slate-400">/ бесплатно</span>
+          </div>
+          <p class="mt-3 text-xs text-slate-400">
+            Чтобы ты лично убедился, что на твоём компьютере всё летает, прежде чем платить.
+          </p>
+          <ul class="mt-6 space-y-3 text-sm text-slate-300">
+            <li>✓ Автоопределение твоей видеокарты</li>
+            <li>✓ Разделение вокала и распознавание текста</li>
+            <li>✓ Доступ ко всему таймлайну и эффектам</li>
+            <li>✓ Экспорт первых 45 секунд трека (проверка рендера)</li>
+          </ul>
+        </div>
+        <a
+          href="https://github.com/Serufim/karaoke_machine/releases"
+          target="_blank"
+          onclick="trackClick('download_demo')"
+          class="mt-8 w-full py-3 rounded-xl font-semibold text-sm bg-slate-800 hover:bg-slate-700 text-white text-center border border-slate-700 transition block"
+        >
+          Скачать установщик (Win / Mac)
+        </a>
+      </div>
+
+      <!-- Tier 2: Early Bird Home (Highlighted) -->
+      <div class="p-7 rounded-2xl bg-gradient-to-b from-slate-900 to-[#0d1829] border-2 border-sky-500 shadow-2xl shadow-sky-500/10 flex flex-col justify-between relative">
+        <div class="absolute -top-3.5 right-6 px-3 py-1 rounded-full text-[11px] font-bold uppercase bg-gradient-to-r from-sky-500 to-indigo-600 text-white shadow">
+          Хит предзаказа (-50%)
+        </div>
+        <div>
+          <div class="text-xs font-mono uppercase text-sky-400">Для себя, вечеринок и контента</div>
+          <h3 class="mt-2 text-2xl font-bold text-white">Early Bird Indie</h3>
+          <div class="mt-4 flex items-baseline space-x-2">
+            <span class="text-4xl font-black text-white">690 ₽</span>
+            <span class="text-sm text-slate-400 font-semibold">($7)</span>
+            <span class="text-xs text-slate-500 line-through ml-1">1 490 ₽ ($15 в Steam)</span>
+          </div>
+          <p class="mt-3 text-xs text-sky-200/80">
+            Разовая покупка навсегда. Никаких ежемесячных платежей.
+          </p>
+          <ul class="mt-6 space-y-3 text-sm text-slate-200">
+            <li>✓ <b>Безлимитная длина и количество треков</b></li>
+            <li>✓ Без водяных знаков в 1080p / 60 FPS</li>
+            <li>✓ Все русские модели Whisper Turbo и Wav2Vec2</li>
+            <li>✓ Лицензия на Windows и macOS</li>
+            <li>✓ <b>Официальный Steam-ключ</b> после выхода в Steam</li>
+          </ul>
+        </div>
+        <button
+          onclick="openWaitlistModal('Early Bird Indie (690 ₽ / $7)')"
+          class="mt-8 w-full py-3.5 rounded-xl font-bold text-sm bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white shadow-lg shadow-sky-500/25 transition"
+        >
+          Забронировать за 690 ₽ ($7)
+        </button>
+      </div>
+
+      <!-- Tier 3: Pro / Commercial -->
+      <div class="p-7 rounded-2xl bg-studio-panel border border-slate-800 flex flex-col justify-between">
+        <div>
+          <div class="text-xs font-mono uppercase text-amber-400">Для ведущих, DJ и караоке-баров</div>
+          <h3 class="mt-2 text-2xl font-bold text-white">Studio Commercial</h3>
+          <div class="mt-4 flex items-baseline space-x-2">
+            <span class="text-4xl font-black text-white">2 490 ₽</span>
+            <span class="text-sm text-slate-400 font-semibold">($25)</span>
+          </div>
+          <p class="mt-3 text-xs text-slate-400">
+            Окупается за одно мероприятие или вечер в караоке-клубе.
+          </p>
+          <ul class="mt-6 space-y-3 text-sm text-slate-300">
+            <li>✓ Всё из тарифа Early Bird Indie</li>
+            <li>✓ <b>Право коммерческого использования</b> на мероприятиях и в барах</li>
+            <li>✓ Пакетная обработка плейлистов (Batch Queue)</li>
+            <li>✓ Загрузка своего логотипа / брендинга на видео</li>
+            <li>✓ Приоритетная поддержка в закрытом чате</li>
+          </ul>
+        </div>
+        <button
+          onclick="openWaitlistModal('Studio Commercial (2 490 ₽ / $25)')"
+          class="mt-8 w-full py-3 rounded-xl font-semibold text-sm bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 transition"
+        >
+          Оформить коммерческий предзаказ
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ Section -->
+  <section id="faq" class="py-16 px-4 sm:px-6 max-w-4xl mx-auto border-t border-slate-800/80">
+    <h2 class="text-2xl sm:text-3xl font-extrabold text-center mb-10">Частые вопросы (FAQ)</h2>
+    <div class="space-y-4">
+      <div class="p-5 rounded-xl bg-studio-panel border border-slate-800">
+        <h4 class="font-bold text-white text-sm sm:text-base">Что если на моём ПК что-то не запустится?</h4>
+        <p class="mt-2 text-xs sm:text-sm text-slate-400 leading-relaxed">
+          Именно поэтому у нас есть бесплатная Beta-версия в GitHub Releases! Ты можешь сначала скачать её за 0 ₽, программа сама проверит твою видеокарту и процессор, и ты увидишь результат до оплаты.
+        </p>
+      </div>
+      <div class="p-5 rounded-xl bg-studio-panel border border-slate-800">
+        <h4 class="font-bold text-white text-sm sm:text-base">Зачем программе весить несколько гигабайт при скачивании моделей?</h4>
+        <p class="mt-2 text-xs sm:text-sm text-slate-400 leading-relaxed">
+          Сам установщик весит немного, а нейросети (Demucs и Whisper) скачиваются прямо внутри приложения через удобный «Менеджер моделей» в изолированную папку. Зато после скачивания программа работает вообще без интернета и бесплатно!
+        </p>
+      </div>
+      <div class="p-5 rounded-xl bg-studio-panel border border-slate-800">
+        <h4 class="font-bold text-white text-sm sm:text-base">Как оплатить из России и СНГ?</h4>
+        <p class="mt-2 text-xs sm:text-sm text-slate-400 leading-relaxed">
+          Оплата предзаказа будет доступна как обычными картами РФ (МИР / СБП), так и зарубежными картами, плюс вы получите ключ для активации в Steam, как только страница магазина пройдёт модерацию Valve.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="py-10 px-4 border-t border-slate-900 text-center text-xs text-slate-500">
+    <div class="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>© 2026 AI Karaoke Studio. Все права защищены. Создано для музыкантов, ведущих и любителей караоке.</div>
+      <div class="flex items-center space-x-5">
+        <a href="https://github.com/Serufim/karaoke_machine" target="_blank" class="hover:text-slate-300">GitHub</a>
+        <a href="https://github.com/Serufim/karaoke_machine/releases" target="_blank" class="hover:text-slate-300">Скачать релиз</a>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Waitlist / Pre-order Modal -->
+  <div id="waitlist-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="w-full max-w-md rounded-2xl bg-studio-panel border border-slate-700 shadow-2xl overflow-hidden">
+      <div class="px-6 py-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
+        <h3 class="font-bold text-white text-sm sm:text-base">Бронирование скидки 50% и доступ к Beta</h3>
+        <button onclick="closeWaitlistModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
+      </div>
+
+      <form id="waitlist-form" onsubmit="submitWaitlistForm(event)" class="p-6 space-y-4 text-xs sm:text-sm">
+        <div class="p-3 rounded-xl bg-sky-500/10 border border-sky-500/30 text-sky-200 text-xs">
+          Выбранный тариф: <b id="selected-plan-label" class="text-white">Early Bird Indie (690 ₽ / $7)</b>
+          <div class="mt-1 text-[11px] text-sky-300/80">
+            Мы завершаем финальное тестирование установщика перед публикацией в Steam. Денег сейчас не списываем — оставь контакт, чтобы зафиксировать за собой скидку 50% и получить билд!
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-slate-300 font-medium mb-1">Твой Telegram (@username) или Email *</label>
+          <input
+            type="text"
+            id="lead-contact"
+            required
+            placeholder="@username или you@mail.ru"
+            class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:border-sky-500"
+          />
+        </div>
+
+        <div>
+          <label class="block text-slate-300 font-medium mb-1">Какая у тебя система?</label>
+          <select
+            id="lead-os"
+            class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:border-sky-500"
+          >
+            <option value="Windows + NVIDIA GPU">Windows (видеокарта NVIDIA)</option>
+            <option value="Windows + AMD/Intel">Windows (AMD или без видеокарты)</option>
+            <option value="macOS Apple Silicon">macOS (MacBook M1 / M2 / M3 / M4)</option>
+            <option value="Linux">Linux</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-slate-300 font-medium mb-1">Для чего планируешь использовать?</label>
+          <select
+            id="lead-usecase"
+            class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:border-sky-500"
+          >
+            <option value="home">Для себя, друзей и домашних вечеринок</option>
+            <option value="pro">Ведущий мероприятий / DJ / Караоке-бар</option>
+            <option value="creator">Делаю каверы / YouTube-канал / TikTok</option>
+          </select>
+        </div>
+
+        <button
+          type="submit"
+          id="submit-lead-btn"
+          class="w-full py-3 rounded-xl font-bold bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white shadow-lg transition"
+        >
+          Зафиксировать скидку 50% и получить доступ
+        </button>
+      </form>
+
+      <!-- Success State -->
+      <div id="waitlist-success" class="hidden p-6 text-center space-y-4">
+        <div class="text-4xl">🎉</div>
+        <h4 class="text-lg font-bold text-white">Скидка 50% закреплена за тобой!</h4>
+        <p class="text-xs sm:text-sm text-slate-300 leading-relaxed">
+          Твоя заявка сохранена. Мы пришлём тебе промокод и прямую ссылку на активацию сразу на старте продаж, а прямо сейчас ты можешь скачать свежий билд на GitHub:
+        </p>
+        <div class="pt-2 flex flex-col gap-2.5">
+          <a
+            href="https://github.com/Serufim/karaoke_machine/releases"
+            target="_blank"
+            class="w-full py-3 rounded-xl font-bold text-xs sm:text-sm bg-emerald-600 hover:bg-emerald-500 text-white transition block"
+          >
+            📥 Перейти к скачиванию Beta-версии
+          </a>
+          <button
+            onclick="closeWaitlistModal()"
+            class="w-full py-2.5 rounded-xl text-xs text-slate-400 hover:text-white"
+          >
+            Вернуться на сайт
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
