@@ -1,6 +1,8 @@
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -82,12 +84,22 @@ class RebuildRequest(BaseModel):
     highlight_color: str = "gold_neon"
     dual_audio_mp4: bool = True
     watermark_text: Optional[str] = None
+    export_dir: Optional[str] = None
 
 
 class DjExportRequest(BaseModel):
     editor_text: Optional[str] = None
     vocal_volume: float = 0.0
     vocal_intervals: Optional[List[Dict[str, Any]]] = None
+    export_dir: Optional[str] = None
+
+
+class OpenFolderRequest(BaseModel):
+    path: str
+
+
+class SelectFolderRequest(BaseModel):
+    initial_dir: Optional[str] = None
 
 
 class UpdateStateRequest(BaseModel):
@@ -115,6 +127,108 @@ def get_available_models() -> Dict[str, List[str]]:
 def get_hardware_info() -> Dict[str, Any]:
     """Returns detected hardware profile, GPU/CUDA/MPS capabilities, and recommended models."""
     return get_hardware_profile_dict()
+
+
+def get_preset_folders() -> Dict[str, str]:
+    home = Path.home()
+    presets = {
+        "output": str(OUTPUT_DIR.resolve()),
+        "desktop": str(home / "Desktop"),
+        "downloads": str(home / "Downloads"),
+        "music": str(home / "Music"),
+    }
+    return {k: v for k, v in presets.items() if Path(v).exists() or k == "output"}
+
+
+def pick_folder_native(initial_dir: Optional[str] = None) -> Optional[str]:
+    # 1. Check pywebview active windows
+    try:
+        import webview
+        if webview.windows and len(webview.windows) > 0:
+            res = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG, directory=initial_dir or "")
+            if res and len(res) > 0:
+                return str(res[0])
+            return None
+    except Exception:
+        pass
+
+    # 2. macOS Cocoa choose folder
+    if sys.platform == "darwin":
+        try:
+            default_loc = f'default location POSIX file "{initial_dir}"' if initial_dir and Path(initial_dir).exists() else ""
+            cmd = ['osascript', '-e', f'POSIX path of (choose folder with prompt "Выберите папку для сохранения караоке" {default_loc})']
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            chosen = res.stdout.strip()
+            if chosen:
+                return chosen
+        except Exception:
+            return None
+
+    # 3. Windows PowerShell FolderBrowserDialog
+    elif sys.platform == "win32":
+        try:
+            ps_cmd = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                "$f.Description = 'Выберите папку для сохранения караоке'; "
+                "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
+            )
+            res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True)
+            chosen = res.stdout.strip()
+            if chosen:
+                return chosen
+        except Exception:
+            return None
+
+    # 4. Tkinter fallback
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        folder = filedialog.askdirectory(initialdir=initial_dir or str(Path.home()))
+        root.destroy()
+        if folder:
+            return folder
+    except Exception:
+        pass
+
+    return None
+
+
+def open_folder_in_os(folder_path: Path):
+    if not folder_path.exists():
+        folder_path.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(folder_path)])
+    elif sys.platform == "win32":
+        os.startfile(str(folder_path))
+    else:
+        subprocess.run(["xdg-open", str(folder_path)])
+
+
+@router.get("/system/folders")
+def get_system_preset_folders() -> Dict[str, Any]:
+    """Returns detected common folders for quick export selection."""
+    return {"presets": get_preset_folders(), "default": str(OUTPUT_DIR.resolve())}
+
+
+@router.post("/system/select-folder")
+def select_folder_dialog(req: SelectFolderRequest) -> Dict[str, Any]:
+    """Opens OS native folder picker dialog and returns selected path."""
+    chosen = pick_folder_native(req.initial_dir)
+    return {"selected_path": chosen}
+
+
+@router.post("/system/open-folder")
+def open_folder_endpoint(req: OpenFolderRequest) -> Dict[str, Any]:
+    """Opens target folder in Finder / Windows Explorer."""
+    p = Path(req.path)
+    if not p.is_dir() and p.parent.is_dir():
+        p = p.parent
+    open_folder_in_os(p)
+    return {"status": "opened", "path": str(p)}
 
 
 @router.get("/models/catalog")
@@ -521,6 +635,7 @@ def _run_rebuild_task(
     highlight_color: str,
     dual_audio_mp4: bool = True,
     watermark_text: Optional[str] = None,
+    export_dir: Optional[str] = None,
 ):
     reset_cancel()
 
@@ -576,6 +691,22 @@ def _run_rebuild_task(
             progress_callback=update_progress,
         )
 
+        exported_path: Optional[str] = None
+        target_dir: Optional[Path] = None
+        if export_dir:
+            try:
+                target_dir = Path(export_dir).resolve()
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_video = target_dir / final_video.name
+                shutil.copy2(final_video, target_video)
+                ass_file = OUTPUT_DIR / f"{title}_karaoke.ass"
+                if ass_file.exists():
+                    shutil.copy2(ass_file, target_dir / ass_file.name)
+                exported_path = str(target_video)
+                state_data["export_dir"] = str(target_dir)
+            except Exception as e:
+                print(f"[Rebuild] Warning: Could not copy to export_dir: {e}")
+
         # Persist final state back to disk so reloading on frontend never loses fx_intervals or vocal_intervals
         state_data["editor_text"] = updated_editor_text
         state_data["lines"] = editor_text_to_lines(updated_editor_text, original_lines=state_data.get("lines", []))
@@ -583,12 +714,15 @@ def _run_rebuild_task(
         state_file = WORK_DIR / f"{title}_state.json"
         state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+        save_msg = f" и сохранен в:\n{target_dir.name}" if target_dir else ""
         ws_manager.broadcast_threadsafe({
             "type": "completed",
             "action": "rebuild",
             "title": title,
             "video_path": str(final_video),
-            "message": f"🎬 Видео для '{title}' успешно обновлено!",
+            "exported_path": exported_path,
+            "export_dir": str(target_dir) if target_dir else str(OUTPUT_DIR.resolve()),
+            "message": f"🎬 Видео для '{title}' успешно обновлено{save_msg}!",
         })
     except GenerationCancelledError:
         ws_manager.broadcast_threadsafe({
@@ -655,6 +789,7 @@ def start_rebuild(payload: RebuildRequest) -> Dict[str, Any]:
             payload.highlight_color,
             payload.dual_audio_mp4,
             payload.watermark_text,
+            payload.export_dir,
         ),
         daemon=True,
     )
@@ -679,6 +814,18 @@ def build_project_dj_pack(title: str, payload: DjExportRequest) -> Dict[str, Any
         vocal_volume=payload.vocal_volume,
         vocal_intervals=payload.vocal_intervals if payload.vocal_intervals is not None else state_data.get("vocal_intervals"),
     )
+
+    exported_dir: Optional[str] = None
+    if payload.export_dir:
+        try:
+            target_dir = Path(payload.export_dir).resolve()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dj_zip_path, target_dir / dj_zip_path.name)
+            shutil.copy2(kfn_path, target_dir / kfn_path.name)
+            exported_dir = str(target_dir)
+        except Exception as e:
+            print(f"[DJ Pack] Warning: Could not copy to export_dir: {e}")
+
     return {
         "status": "ok",
         "title": title,
@@ -686,6 +833,7 @@ def build_project_dj_pack(title: str, payload: DjExportRequest) -> Dict[str, Any
         "kfn_url": f"/api/media/{title}/kfn",
         "dj_pack_filename": dj_zip_path.name,
         "kfn_filename": kfn_path.name,
+        "exported_dir": exported_dir,
     }
 
 

@@ -1,9 +1,21 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useProjectStore } from '@/stores/project'
 import { usePipelineStore } from '@/stores/pipeline'
 import { usePlayerStore } from '@/stores/player'
-import { X, Video, Sliders, Upload, Camera, Disc, Download, Sparkles } from 'lucide-vue-next'
+import {
+  X,
+  Video,
+  Sliders,
+  Upload,
+  Camera,
+  Disc,
+  Download,
+  Sparkles,
+  FolderOpen,
+  Folder,
+  ExternalLink,
+} from 'lucide-vue-next'
 
 const emit = defineEmits<{
   (e: 'close'): void
@@ -24,12 +36,72 @@ const highlightColor = ref('gold_neon')
 const dualAudioMp4 = ref(true)
 const watermarkText = ref(projectStore.currentProject?.watermark_text || '')
 const isExportingDjPack = ref(false)
-const djPackResult = ref<{ dj_pack_url: string; kfn_url: string; dj_pack_filename: string; kfn_filename: string } | null>(null)
+const djPackResult = ref<{ dj_pack_url: string; kfn_url: string; dj_pack_filename: string; kfn_filename: string; exported_dir?: string } | null>(null)
 const djExportError = ref('')
+
+const exportDir = ref<string>(localStorage.getItem('studio_export_dir') || '')
+const presetFolders = ref<Record<string, string>>({})
+const defaultExportDir = ref<string>('')
 
 const coverInputRef = ref<HTMLInputElement | null>(null)
 const bgInputRef = ref<HTMLInputElement | null>(null)
 const uploadStatus = ref('')
+
+async function fetchPresetFolders() {
+  try {
+    const res = await fetch('/api/system/folders')
+    if (res.ok) {
+      const data = await res.json()
+      presetFolders.value = data.presets || {}
+      defaultExportDir.value = data.default || ''
+      if (!exportDir.value) {
+        exportDir.value = data.default || ''
+      }
+    }
+  } catch (_) {}
+}
+
+async function onSelectFolder() {
+  try {
+    const res = await fetch('/api/system/select-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initial_dir: exportDir.value || defaultExportDir.value }),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      if (data.selected_path) {
+        exportDir.value = data.selected_path
+        localStorage.setItem('studio_export_dir', data.selected_path)
+      }
+    }
+  } catch (_) {}
+}
+
+function setExportFolderPreset(path: string) {
+  exportDir.value = path
+  localStorage.setItem('studio_export_dir', path)
+}
+
+function onExportDirInput(e: Event) {
+  const val = (e.target as HTMLInputElement).value
+  exportDir.value = val
+  localStorage.setItem('studio_export_dir', val)
+}
+
+async function onOpenFolder(path?: string) {
+  try {
+    await fetch('/api/system/open-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: path || exportDir.value || defaultExportDir.value }),
+    })
+  } catch (_) {}
+}
+
+onMounted(() => {
+  fetchPresetFolders()
+})
 
 const coverUrl = computed(() => {
   if (!projectStore.currentProject?.title) return ''
@@ -90,6 +162,7 @@ async function onSubmit() {
     highlight_color: highlightColor.value,
     dual_audio_mp4: dualAudioMp4.value,
     watermark_text: watermarkText.value.trim() || null,
+    export_dir: exportDir.value || null,
   })
 
   emit('close')
@@ -108,6 +181,7 @@ async function onBuildDjPack() {
         editor_text: projectStore.currentProject.editor_text,
         vocal_volume: vocalVolumePct.value / 100,
         vocal_intervals: projectStore.currentProject.vocal_intervals,
+        export_dir: exportDir.value || null,
       }),
     })
     if (!res.ok) {
@@ -437,6 +511,58 @@ async function onBuildDjPack() {
                   <span>Скачать .KFN (EnCore! / KaraFun)</span>
                 </a>
               </div>
+            </div>
+          </div>
+
+          <!-- Export Destination Directory -->
+          <div class="pt-3 border-t border-studio-border space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-slate-200 font-medium flex items-center space-x-1.5">
+                <FolderOpen class="w-4 h-4 text-amber-400" />
+                <span>Куда сохранить готовые файлы:</span>
+              </label>
+              <button
+                type="button"
+                @click="onOpenFolder()"
+                class="text-[11px] text-amber-400 hover:text-amber-300 flex items-center space-x-1 transition-colors"
+                title="Открыть выбранную папку в проводнике / Finder"
+              >
+                <ExternalLink class="w-3 h-3" />
+                <span>Открыть папку</span>
+              </button>
+            </div>
+
+            <div class="flex items-center space-x-2">
+              <input
+                type="text"
+                :value="exportDir"
+                @input="onExportDirInput"
+                placeholder="Путь к папке (по умолчанию ./output)..."
+                class="flex-1 bg-studio-surface border border-studio-border rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none gold-select font-mono"
+              />
+              <button
+                type="button"
+                @click="onSelectFolder"
+                class="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 font-semibold text-xs shrink-0 flex items-center space-x-1 transition-all"
+                title="Выбрать папку через системный проводник / Finder"
+              >
+                <Folder class="w-3.5 h-3.5" />
+                <span>Обзор...</span>
+              </button>
+            </div>
+
+            <!-- Quick folder pills -->
+            <div class="flex flex-wrap gap-1.5 pt-0.5">
+              <button
+                v-for="(path, key) in presetFolders"
+                :key="key"
+                type="button"
+                @click="setExportFolderPreset(path)"
+                class="px-2 py-0.5 rounded text-[10px] font-medium transition-colors border"
+                :class="exportDir === path ? 'border-amber-500 bg-amber-500/20 text-amber-200 font-semibold gold-glow-subtle' : 'border-slate-700 bg-slate-800/80 text-slate-400 hover:text-white'"
+              >
+                {{ key === 'output' ? '📁 output/' : key === 'desktop' ? '🖥️ Рабочий стол' : key === 'downloads' ? '📥 Загрузки' : key === 'music' ? '🎵 Музыка' : path }}
+              </button>
             </div>
           </div>
         </div>

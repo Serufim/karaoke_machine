@@ -244,3 +244,16 @@ def test_rebuild_preserves_fx_intervals_in_state(tmp_path):
     finally:
         state_file.unlink(missing_ok=True)
 
+
+def test_system_folder_endpoints():
+    res = client.get("/api/system/folders")
+    assert res.status_code == 200
+    data = res.json()
+    assert "presets" in data
+    assert "default" in data
+    assert "output" in data["presets"]
+
+    res_open = client.post("/api/system/open-folder", json={"path": "./output"})
+    assert res_open.status_code == 200
+    assert res_open.json()["status"] == "opened"
+
