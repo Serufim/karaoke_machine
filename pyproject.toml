@@ -23,6 +23,7 @@ dependencies = [
     "websockets>=12.0",
     "python-multipart>=0.0.9",
     "pywebview>=6.2.1",
+    "mcp>=2.3.0",
 ]
 
 [project.scripts]
@@ -31,6 +32,7 @@ karaoke-app = "karaoke.desktop_app:main"
 karaoke-ui = "karaoke.server:main"
 karaoke-gradio = "karaoke.app_ui:main"
 karaoke-server = "karaoke.server:main"
+karaoke-mcp = "karaoke.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]

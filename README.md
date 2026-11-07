@@ -135,6 +135,45 @@ uv run python run_ui.py --gradio
 
 ---
 
+## 🤖 MCP Server (Model Context Protocol)
+
+В AI Karaoke Studio встроен официальный **MCP-сервер** (`Model Context Protocol`), позволяющий автономным AI-агентам (Claude Desktop, Antigravity, Cursor, Windsurf и др.) управлять караоке-студией напрямую через естественный диалог.
+
+### Возможности для AI-агентов:
+* 🔍 **Анализ проектов:** просмотр списка караоке-проектов, чтение распознанных слов, слогов и таймингов (`list_projects`, `get_project`).
+* ⚡ **Автономная генерация:** создание караоке-видео из локального аудио или ссылки с заданными параметрами нейросетей (`generate_karaoke`).
+* 🔄 **Умная перегенерация:** изменение параметров (Whisper, Demucs, CTC, VAD) и перегенерация с повторным использованием кэша стемов (`regenerate_project`).
+* ⏱️ **Коррекция таймингов:** автономный сдвиг строк и слов, исправление рассинхрона (`shift_line_timing`, `update_project_lyrics`).
+* 🎬 **Мгновенный рендеринг:** пересборка субтитров и финального видео Full HD без повторного прогона нейросетей (`rebuild_video`).
+* 🖥️ **Диагностика железа:** опрос доступных видеокарт (Apple Silicon MPS / NVIDIA CUDA) и каталога моделей (`get_hardware_profile`, `get_models_catalog`).
+
+### Подключение к Claude Desktop / Cursor / Antigravity
+
+Добавьте конфигурацию в ваш файл `claude_desktop_config.json` (или в настройки MCP вашей IDE):
+
+```json
+{
+  "mcpServers": {
+    "karaoke-studio": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/полный/путь/к/karaoke_machine",
+        "karaoke-mcp"
+      ]
+    }
+  }
+}
+```
+
+Для ручной проверки работоспособности MCP-сервера в консоли:
+```bash
+uv run karaoke-mcp
+```
+
+---
+
 ## 🧪 Запуск тестов
 
 ```bash
