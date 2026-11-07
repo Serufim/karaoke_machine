@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "karaoke-studio": {
+      "command": "uv",
+      "args": [
+        "run",
+        "karaoke-mcp"
+      ]
+    }
+  }
+}

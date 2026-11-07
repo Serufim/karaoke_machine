@@ -135,21 +135,54 @@ uv run python run_ui.py --gradio
 
 ---
 
-## 🤖 MCP Server (Model Context Protocol)
+## 🤖 MCP Server (Model Context Protocol) & AI Agents
 
-В AI Karaoke Studio встроен официальный **MCP-сервер** (`Model Context Protocol`), позволяющий автономным AI-агентам (Claude Desktop, Antigravity, Cursor, Windsurf и др.) управлять караоке-студией напрямую через естественный диалог.
+В AI Karaoke Studio встроен официальный **MCP-сервер** (`Model Context Protocol`), позволяющий автономным AI-агентам (**Google Antigravity**, **Claude Desktop**, **Cursor**, **Windsurf** и др.) управлять полным циклом создания караоке через естественный диалог.
 
 ### Возможности для AI-агентов:
-* 🔍 **Анализ проектов:** просмотр списка караоке-проектов, чтение распознанных слов, слогов и таймингов (`list_projects`, `get_project`).
-* ⚡ **Автономная генерация:** создание караоке-видео из локального аудио или ссылки с заданными параметрами нейросетей (`generate_karaoke`).
-* 🔄 **Умная перегенерация:** изменение параметров (Whisper, Demucs, CTC, VAD) и перегенерация с повторным использованием кэша стемов (`regenerate_project`).
-* ⏱️ **Коррекция таймингов:** автономный сдвиг строк и слов, исправление рассинхрона (`shift_line_timing`, `update_project_lyrics`).
-* 🎬 **Мгновенный рендеринг:** пересборка субтитров и финального видео Full HD без повторного прогона нейросетей (`rebuild_video`).
-* 🖥️ **Диагностика железа:** опрос доступных видеокарт (Apple Silicon MPS / NVIDIA CUDA) и каталога моделей (`get_hardware_profile`, `get_models_catalog`).
+* 🔍 **Анализ проектов (`list_projects`, `get_project`):** инспекция существующих караоке-проектов, чтение распознанных слов, слогов и точных таймингов.
+* ⚡ **Автономная генерация (`generate_karaoke`):** создание караоке-видео из локального аудиофайла или YouTube-ссылки с нужными моделями (Whisper, Demucs, CTC, VAD).
+* 🔄 **Умная перегенерация (`regenerate_project`):** смена настроек нейросетей с автоматическим переиспользованием кэша разделения стемов.
+* ⏱️ **Коррекция таймингов (`shift_line_timing`, `update_project_lyrics`):** смещение строк или правка текста прямо в `karaoke_state.json`.
+* 🎬 **Мгновенный рендеринг (`rebuild_video`):** пересборка ASS-субтитров и Full HD видео без повторного прогона нейросетей.
+* 🖥️ **Диагностика железа (`get_hardware_profile`, `get_models_catalog`):** проверка видеокарт (Apple Silicon MPS / NVIDIA CUDA) и рекомендации параметров.
 
-### Подключение к Claude Desktop / Cursor / Antigravity
+---
 
-Добавьте конфигурацию в ваш файл `claude_desktop_config.json` (или в настройки MCP вашей IDE):
+### 🚀 Подключение к Google Antigravity
+
+В репозиторий уже включена конфигурация для Antigravity:
+1. **Проектный уровень:** файл [`.agents/mcp_config.json`](file:///.agents/mcp_config.json) автоматически регистрирует MCP-сервер при открытии папки проекта.
+2. **Встроенный навык (Skill):** файл [`.agents/skills/karaoke-automation/SKILL.md`](file:///.agents/skills/karaoke-automation/SKILL.md) обучает агентов Antigravity лучшим практикам и цепочкам вызовов караоке-пайплайна.
+
+Для **глобального подключения во всех проектах Antigravity** добавьте в `~/.gemini/config/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "karaoke-studio": {
+      "command": "/Users/ВАШ_ПОЛЬЗОВАТЕЛЬ/.local/bin/uv",
+      "args": [
+        "run",
+        "--directory",
+        "/полный/путь/к/karaoke_machine",
+        "karaoke-mcp"
+      ]
+    }
+  }
+}
+```
+
+#### Примеры промптов для агентов Antigravity:
+* *«Сделай караоке из трека `tracks/hit.mp3` с текстом песни из `lyrics.txt`, включи русское CTC выравнивание и модель `large-v3-turbo`»*
+* *«Посмотри последний проект в папке `output/`, проверь 4-ю строчку текста и сдвинь её начало на 0.4 секунды раньше»*
+* *«Пересобери видео проекта `queen_bohemian` в неоновом стиле `gold_neon`»*
+
+---
+
+### 💻 Подключение к Claude Desktop / Cursor
+
+В файл `claude_desktop_config.json` (или настройки MCP в Cursor):
 
 ```json
 {
@@ -167,7 +200,7 @@ uv run python run_ui.py --gradio
 }
 ```
 
-Для ручной проверки работоспособности MCP-сервера в консоли:
+Ручная проверка работоспособности MCP-сервера в терминале:
 ```bash
 uv run karaoke-mcp
 ```
