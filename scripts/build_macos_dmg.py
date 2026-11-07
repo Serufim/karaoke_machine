@@ -122,13 +122,21 @@ def build_macos_app_and_dmg() -> Path:
     print("🎨 Генерация иконки приложения AppIcon.icns...")
     create_app_icon_icns(icns_path)
 
-    # 3. Write Info.plist
+    # 3. Copy source code and assets into Resources for self-contained execution
+    print("📋 Копирование исходных файлов и ассетов в Resources...")
+    shutil.copytree(ROOT_DIR / "src", resources_dir / "src", dirs_exist_ok=True)
+    shutil.copy2(ROOT_DIR / "pyproject.toml", resources_dir / "pyproject.toml")
+    shutil.copy2(ROOT_DIR / "run_ui.py", resources_dir / "run_ui.py")
+    if (FRONTEND_DIR / "dist").exists():
+        shutil.copytree(FRONTEND_DIR / "dist", resources_dir / "frontend" / "dist", dirs_exist_ok=True)
+
+    # 4. Write Info.plist
     info_plist = {
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": "ru.karaokestudio.ai.app",
-        "CFBundleVersion": "0.5.0",
-        "CFBundleShortVersionString": "0.5.0",
+        "CFBundleVersion": "0.5.1",
+        "CFBundleShortVersionString": "0.5.1",
         "CFBundlePackageType": "APPL",
         "CFBundleExecutable": "AIKaraokeStudioLauncher",
         "CFBundleIconFile": "AppIcon.icns",
@@ -139,26 +147,48 @@ def build_macos_app_and_dmg() -> Path:
     with open(contents_dir / "Info.plist", "wb") as f:
         plistlib.dump(info_plist, f)
 
-    # 4. Write native launcher script inside Contents/MacOS/AIKaraokeStudioLauncher
+    # 5. Write native launcher script inside Contents/MacOS/AIKaraokeStudioLauncher
     venv_python = ROOT_DIR / ".venv" / "bin" / "python"
     launcher_path = macos_dir / "AIKaraokeStudioLauncher"
     launcher_script = f"""#!/bin/zsh
-export PATH="/opt/homebrew/opt/ffmpeg-full/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+export PATH="/opt/homebrew/opt/ffmpeg-full/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 export PYTHONIOENCODING="utf-8"
 export LANG="en_US.UTF-8"
 
-PROJECT_ROOT="{ROOT_DIR}"
-cd "$PROJECT_ROOT" || exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONTENTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
-LOG_FILE="$PROJECT_ROOT/output/desktop_app.log"
-mkdir -p "$PROJECT_ROOT/output"
+# Determine working root directory
+if [ -d "{ROOT_DIR}/src" ]; then
+    APP_ROOT="{ROOT_DIR}"
+elif [ -d "$RESOURCES_DIR/src" ]; then
+    APP_ROOT="$RESOURCES_DIR"
+else
+    APP_ROOT="$CONTENTS_DIR"
+fi
+
+cd "$APP_ROOT" || exit 1
+
+LOG_DIR="$HOME/Library/Logs/AIKaraokeStudio"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/desktop_app.log"
+
+export PYTHONPATH="$APP_ROOT/src:$PYTHONPATH"
 
 if [ -x "{venv_python}" ]; then
     exec "{venv_python}" -m karaoke.desktop_app >> "$LOG_FILE" 2>&1
+elif [ -x "$HOME/karaoke_machine/.venv/bin/python" ]; then
+    exec "$HOME/karaoke_machine/.venv/bin/python" -m karaoke.desktop_app >> "$LOG_FILE" 2>&1
 elif command -v uv >/dev/null 2>&1; then
-    exec uv run karaoke-app >> "$LOG_FILE" 2>&1
+    exec uv run --directory "$APP_ROOT" python -m karaoke.desktop_app >> "$LOG_FILE" 2>&1
+elif command -v python3.11 >/dev/null 2>&1; then
+    exec python3.11 -m karaoke.desktop_app >> "$LOG_FILE" 2>&1
+elif command -v python3 >/dev/null 2>&1; then
+    exec python3 -m karaoke.desktop_app >> "$LOG_FILE" 2>&1
 else
-    exec python3 "$PROJECT_ROOT/run_ui.py" >> "$LOG_FILE" 2>&1
+    osascript -e 'display alert "AI Karaoke Studio" message "Python 3.11 или менеджер uv не найдены.\\nУстановите uv через терминал:\\ncurl -LsSf https://astral.sh/uv/install.sh | sh" as critical'
+    exit 1
 fi
 """
     launcher_path.write_text(launcher_script, encoding="utf-8")
