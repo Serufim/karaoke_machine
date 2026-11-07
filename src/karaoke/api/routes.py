@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -7,7 +8,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from PIL import Image
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -33,11 +34,17 @@ from karaoke.separator import DEMUCS_MODELS
 from karaoke.transcriber import WHISPER_MODELS
 from karaoke.video import extract_cover_edge_colors
 from karaoke.hardware import get_hardware_profile_dict
+from karaoke.charts import get_platform_chart
 from karaoke.model_manager import (
     get_models_status_list,
     start_model_download_background,
     delete_model_cache,
     MODEL_CATALOG,
+)
+from karaoke.slice_editor import (
+    align_audio_slice,
+    render_slice_preview_video,
+    apply_slice_to_project,
 )
 
 router = APIRouter(prefix="/api")
@@ -102,6 +109,28 @@ class SelectFolderRequest(BaseModel):
     initial_dir: Optional[str] = None
 
 
+class SliceAlignRequest(BaseModel):
+    title: str
+    start: float
+    end: float
+    text: str
+    mode: str = "whisper"
+
+
+class SlicePreviewRequest(BaseModel):
+    title: str
+    start: float
+    end: float
+    words: List[Dict[str, Any]]
+
+
+class SliceApplyRequest(BaseModel):
+    title: str
+    start: float
+    end: float
+    words: List[Dict[str, Any]]
+
+
 class UpdateStateRequest(BaseModel):
     vocal_intervals: Optional[List[Dict[str, Any]]] = None
     fx_intervals: Optional[List[Dict[str, Any]]] = None
@@ -127,6 +156,12 @@ def get_available_models() -> Dict[str, List[str]]:
 def get_hardware_info() -> Dict[str, Any]:
     """Returns detected hardware profile, GPU/CUDA/MPS capabilities, and recommended models."""
     return get_hardware_profile_dict()
+
+
+@router.get("/charts")
+def get_charts(platform: str = "yandex", country: str = "ru", limit: int = 50) -> Dict[str, Any]:
+    """Fetches music charts for the specified platform and country."""
+    return get_platform_chart(platform=platform, country=country, limit=limit)
 
 
 def get_preset_folders() -> Dict[str, str]:
@@ -339,6 +374,34 @@ def get_project_state(title: str) -> Dict[str, Any]:
         state_data["cover_edge_colors"] = extract_cover_edge_colors(Path(cover_img))
         changed = True
 
+    # Ensure reference_lyrics is populated (reconstructing from editor_text for legacy projects)
+    if not state_data.get("reference_lyrics"):
+        editor_text = state_data.get("editor_text") or ""
+        clean_lines = []
+        for line in editor_text.splitlines():
+            line_str = re.sub(r"^\[\d+:\d+\.\d+\s*->\s*\d+:\d+\.\d+\]\s*", "", line.strip())
+            if line_str:
+                clean_lines.append(line_str)
+        if clean_lines:
+            state_data["reference_lyrics"] = "\n".join(clean_lines)
+
+    # Ensure generation_params exists
+    if not state_data.get("generation_params"):
+        state_data["generation_params"] = {
+            "model_size": "large-v3-turbo",
+            "demucs_model": "htdemucs",
+            "vad": "auditok",
+            "use_ctc_align": False,
+            "use_video_bg": bool(state_data.get("video_bg")),
+            "condition_on_previous_text": False,
+            "strict_repeats": False,
+        }
+
+    # Ensure source_type exists
+    if not state_data.get("source_type"):
+        src = state_data.get("source") or ""
+        state_data["source_type"] = "url" if str(src).startswith(("http://", "https://", "ytsearch")) else "file"
+
     if changed:
         state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -474,6 +537,62 @@ def auto_detect_fx(payload: AutoFxRequest) -> Dict[str, Any]:
     return {"fx_intervals": auto_fx, "count": len(auto_fx)}
 
 
+@router.post("/tools/slice-align")
+def slice_align_endpoint(payload: SliceAlignRequest) -> Dict[str, Any]:
+    try:
+        words = align_audio_slice(
+            title=payload.title,
+            start=payload.start,
+            end=payload.end,
+            text=payload.text,
+            mode=payload.mode,
+            work_dir=WORK_DIR,
+        )
+        return {
+            "status": "ok",
+            "words": words,
+            "count": len(words),
+            "start": payload.start,
+            "end": payload.end,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ошибка калибровки участка: {e}")
+
+
+@router.post("/tools/slice-preview")
+def slice_preview_endpoint(payload: SlicePreviewRequest) -> Dict[str, Any]:
+    try:
+        preview_file, dur = render_slice_preview_video(
+            title=payload.title,
+            start=payload.start,
+            end=payload.end,
+            words=payload.words,
+            work_dir=WORK_DIR,
+        )
+        return {
+            "status": "ok",
+            "duration": dur,
+            "preview_url": f"/api/media/{payload.title}/slice-preview?t={int(time.time() * 1000)}",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ошибка генерации превью участка: {e}")
+
+
+@router.post("/tools/slice-apply")
+def slice_apply_endpoint(payload: SliceApplyRequest) -> Dict[str, Any]:
+    try:
+        res = apply_slice_to_project(
+            title=payload.title,
+            start=payload.start,
+            end=payload.end,
+            words=payload.words,
+            work_dir=WORK_DIR,
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ошибка сохранения участка: {e}")
+
+
 @router.post("/pipeline/cancel")
 def cancel_job() -> Dict[str, Any]:
     killed = request_cancel()
@@ -499,6 +618,11 @@ def _run_generate_task(
     num_lines: int,
     video_quality: str,
     temp_upload_file: Optional[Path] = None,
+    custom_bg: Optional[Union[str, Path]] = None,
+    temp_bg_file: Optional[Path] = None,
+    condition_on_previous_text: bool = False,
+    vad: Optional[str] = "auditok",
+    strict_repeats: bool = False,
 ):
     reset_cancel()
 
@@ -522,8 +646,16 @@ def _run_generate_task(
             use_ctc_align=use_ctc_align,
             download_video=download_video,
             cookies_browser=cookies_browser,
+            custom_bg=custom_bg,
+            condition_on_previous_text=condition_on_previous_text,
+            vad=vad,
+            strict_repeats=strict_repeats,
             progress_callback=update_progress,
         )
+
+        bg_param = Path(state_data["custom_bg"]) if state_data.get("custom_bg") else None
+        use_cov = False if bg_param else (not download_video)
+        use_vid = download_video if not bg_param else False
 
         update_progress("Сборка базового видео караоке...", 0.70)
         final_video, _mixed_audio, updated_editor_text = render_from_state(
@@ -533,8 +665,9 @@ def _run_generate_task(
             vocal_volume=vocal_volume,
             num_lines=num_lines,
             video_quality=video_quality,
-            use_cover_bg=True,
-            use_video_bg=download_video,
+            background=bg_param,
+            use_cover_bg=use_cov,
+            use_video_bg=use_vid,
             progress_callback=update_progress,
         )
 
@@ -561,12 +694,20 @@ def _run_generate_task(
                 temp_upload_file.unlink()
             except Exception:
                 pass
+        if temp_bg_file and temp_bg_file.exists():
+            try:
+                temp_bg_file.unlink()
+            except Exception:
+                pass
 
 
 @router.post("/pipeline/generate")
 async def start_generate(
     file: Optional[UploadFile] = File(None),
+    bg_file: Optional[UploadFile] = File(None),
+    cover_file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
+    existing_project_title: Optional[str] = Form(None),
     model_size: str = Form("large-v3-turbo"),
     demucs_model: str = Form("htdemucs"),
     language: str = Form("ru"),
@@ -577,8 +718,21 @@ async def start_generate(
     num_lines: int = Form(4),
     video_quality: str = Form("balanced"),
     cookies_browser: str = Form("none"),
+    condition_on_previous_text: bool = Form(False),
+    vad: Optional[str] = Form("auditok"),
+    strict_repeats: bool = Form(False),
 ):
     temp_upload_path = None
+    existing_state_data = None
+    if existing_project_title and existing_project_title.strip():
+        proj_title = existing_project_title.strip()
+        state_file = WORK_DIR / f"{proj_title}_state.json"
+        if state_file.exists():
+            try:
+                existing_state_data = json.loads(state_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
     if file and file.filename:
         suffix = Path(file.filename).suffix
         temp_fd, temp_path_str = tempfile.mkstemp(suffix=suffix, prefix="karaoke_upload_")
@@ -589,8 +743,65 @@ async def start_generate(
         source = str(temp_upload_path)
     elif url and url.strip():
         source = url.strip()
+        if not (source.startswith("http://") or source.startswith("https://") or source.startswith("ytsearch")):
+            source = f"ytsearch1:{source} audio"
+    elif existing_state_data:
+        proj_title = existing_state_data["title"]
+        source = None
+        candidates = [
+            existing_state_data.get("source_audio"),
+            WORK_DIR / f"{proj_title}_source.wav",
+            WORK_DIR / f"{proj_title}_source.mp3",
+            WORK_DIR / f"{proj_title}_source.m4a",
+            WORK_DIR / f"{proj_title}_source.flac",
+            WORK_DIR / f"{proj_title}.wav",
+            existing_state_data.get("video_bg"),
+        ]
+        for cand in candidates:
+            if cand and Path(cand).exists():
+                source = str(Path(cand).resolve())
+                break
+
+        if not source:
+            voc = existing_state_data.get("vocals_wav")
+            inst = existing_state_data.get("no_vocals_wav")
+            if voc and inst and Path(voc).exists() and Path(inst).exists():
+                reconstructed_wav = WORK_DIR / f"{proj_title}_source.wav"
+                ffmpeg_bin = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg" or "ffmpeg"
+                try:
+                    subprocess.run([
+                        ffmpeg_bin, "-y",
+                        "-i", str(voc),
+                        "-i", str(inst),
+                        "-filter_complex", "amix=inputs=2:duration=first:dropout_transition=0",
+                        "-c:a", "pcm_s16le",
+                        str(reconstructed_wav)
+                    ], check=True, capture_output=True)
+                    if reconstructed_wav.exists():
+                        source = str(reconstructed_wav)
+                except Exception:
+                    pass
+
+        if not source:
+            raise HTTPException(status_code=400, detail="Не удалось найти аудиофайл проекта для перегенерации.")
     else:
         raise HTTPException(status_code=400, detail="Загрузите файл или укажите ссылку на YouTube.")
+
+    temp_bg_path = None
+    custom_bg_target = None
+    target_img_file = bg_file or cover_file
+    if target_img_file and target_img_file.filename:
+        c_suffix = Path(target_img_file.filename).suffix or ".png"
+        c_fd, c_path_str = tempfile.mkstemp(suffix=c_suffix, prefix="karaoke_custom_bg_")
+        os.close(c_fd)
+        temp_bg_path = Path(c_path_str)
+        with temp_bg_path.open("wb") as buffer:
+            shutil.copyfileobj(target_img_file.file, buffer)
+        custom_bg_target = temp_bg_path
+    elif existing_state_data:
+        saved_bg = existing_state_data.get("custom_bg") or existing_state_data.get("cover_image")
+        if saved_bg and Path(saved_bg).exists():
+            custom_bg_target = Path(saved_bg)
 
     cb = cookies_browser if cookies_browser not in ("none", "file") else None
     vocal_vol = float(vocal_volume_pct) / 100.0
@@ -610,6 +821,11 @@ async def start_generate(
             num_lines,
             video_quality,
             temp_upload_path,
+            custom_bg_target,
+            temp_bg_path,
+            condition_on_previous_text,
+            vad,
+            strict_repeats,
         ),
         daemon=True,
     )
@@ -923,3 +1139,11 @@ def get_cover_image(title: str):
         return FileResponse(default_bg, media_type="image/png")
 
     raise HTTPException(status_code=404, detail="Обложка не найдена.")
+
+
+@router.get("/media/{title}/slice-preview")
+def get_slice_preview_video(title: str):
+    preview_file = WORK_DIR / f"{title}_slice_preview.mp4"
+    if preview_file.exists():
+        return FileResponse(preview_file, media_type="video/mp4")
+    raise HTTPException(status_code=404, detail="Превью видео не найдено.")

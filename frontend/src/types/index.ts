@@ -33,6 +33,19 @@ export interface EmojiInterval {
   intensity: number
 }
 
+export interface GenerationParams {
+  model_size?: string
+  demucs_model?: string
+  language?: string
+  vad?: string
+  use_ctc_align?: boolean
+  use_video_bg?: boolean
+  condition_on_previous_text?: boolean
+  strict_repeats?: boolean
+  vocal_volume_pct?: number
+  num_lines?: number
+}
+
 export interface ProjectState {
   title: string
   duration: number
@@ -51,6 +64,10 @@ export interface ProjectState {
   no_vocals_wav?: string
   vocals_wav?: string
   watermark_text?: string
+  source?: string
+  source_type?: 'file' | 'url'
+  reference_lyrics?: string
+  generation_params?: GenerationParams
 }
 
 export interface ProjectMeta {
@@ -111,4 +128,26 @@ export interface ModelItem {
   status: 'ready' | 'not_downloaded' | 'downloading' | 'error'
   progress: number
 }
+
+export interface ChartTrack {
+  rank: number
+  title: string
+  artist: string
+  cover_url: string | null
+  platform: 'yandex' | 'apple' | 'spotify' | 'zvuk' | 'vk'
+  trend?: string | null
+  search_query: string
+  external_url?: string | null
+}
+
+export interface ChartResponse {
+  status: 'ok' | 'protected' | 'auth_required' | 'error'
+  platform: string
+  platform_name: string
+  country: string
+  description?: string
+  message?: string
+  tracks: ChartTrack[]
+}
+
 

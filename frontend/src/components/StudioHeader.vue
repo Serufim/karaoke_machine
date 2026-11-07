@@ -16,12 +16,16 @@ import {
   Check,
   Film,
   Music,
+  Flame,
+  Sliders,
 } from 'lucide-vue-next'
 
 const emit = defineEmits<{
   (e: 'open-new'): void
   (e: 'open-export'): void
   (e: 'open-models'): void
+  (e: 'open-charts'): void
+  (e: 'open-edit-params'): void
 }>()
 
 const projectStore = useProjectStore()
@@ -205,6 +209,17 @@ onUnmounted(() => {
         <span>Сохранить</span>
       </button>
 
+      <!-- Edit Generation Parameters Button -->
+      <button
+        @click="emit('open-edit-params')"
+        :disabled="!projectStore.hasProject"
+        class="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-[#131c2e] hover:bg-[#19253d] text-sky-300 hover:text-sky-200 border border-[#26354d] hover:border-sky-500/60 disabled:opacity-40 transition-colors shadow-sm"
+        title="Изменить параметры генерации (модели, VAD, CTC, текст, фон) и перегенерировать трек"
+      >
+        <Sliders class="w-3.5 h-3.5 text-sky-400" />
+        <span>Параметры генерации</span>
+      </button>
+
       <!-- Rebuild Button -->
       <button
         @click="emit('open-export')"
@@ -213,6 +228,16 @@ onUnmounted(() => {
       >
         <Video class="w-3.5 h-3.5" />
         <span>Пересобрать MP4</span>
+      </button>
+
+      <!-- Charts Button -->
+      <button
+        @click="emit('open-charts')"
+        class="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-amber-500/20 to-rose-500/20 hover:from-amber-500/30 hover:to-rose-500/30 text-amber-300 border border-amber-500/40 shadow-sm transition-all"
+        title="Свежие тренды и музыкальные чарты"
+      >
+        <Flame class="w-3.5 h-3.5 text-amber-400" />
+        <span>Чарты</span>
       </button>
 
       <!-- New Project Button -->

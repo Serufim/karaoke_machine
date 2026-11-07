@@ -1,3 +1,4 @@
+import json
 from fastapi.testclient import TestClient
 from karaoke.server import app
 
@@ -256,4 +257,168 @@ def test_system_folder_endpoints():
     res_open = client.post("/api/system/open-folder", json={"path": "./output"})
     assert res_open.status_code == 200
     assert res_open.json()["status"] == "opened"
+
+
+def test_charts_endpoints():
+    # 1. Yandex chart
+    res_ya = client.get("/api/charts?platform=yandex&limit=5")
+    assert res_ya.status_code == 200
+    ya_data = res_ya.json()
+    assert ya_data["platform"] == "yandex"
+    assert ya_data["status"] in ("ok", "error")
+    if ya_data["status"] == "ok":
+        assert len(ya_data["tracks"]) > 0
+        t0 = ya_data["tracks"][0]
+        assert "rank" in t0
+        assert "title" in t0
+        assert "artist" in t0
+
+    # 2. Apple Music chart
+    res_apple = client.get("/api/charts?platform=apple&country=ru&limit=5")
+    assert res_apple.status_code == 200
+    apple_data = res_apple.json()
+    assert apple_data["platform"] == "apple"
+    assert apple_data["status"] in ("ok", "error")
+
+    # 3. Spotify chart
+    res_sp = client.get("/api/charts?platform=spotify&limit=5")
+    assert res_sp.status_code == 200
+    sp_data = res_sp.json()
+    assert sp_data["platform"] == "spotify"
+    assert sp_data["status"] in ("ok", "error")
+
+    # 4. Zvuk protection status
+    res_zvuk = client.get("/api/charts?platform=zvuk")
+    assert res_zvuk.status_code == 200
+    zvuk_data = res_zvuk.json()
+    assert zvuk_data["status"] == "protected"
+    assert "Servicepipe" in zvuk_data["description"]
+
+    # 5. VK auth required status
+    res_vk = client.get("/api/charts?platform=vk")
+    assert res_vk.status_code == 200
+    vk_data = res_vk.json()
+    assert vk_data["status"] == "auth_required"
+
+
+def test_slice_align_and_apply_endpoints(tmp_path, monkeypatch):
+    from karaoke.api import routes
+    monkeypatch.setattr(routes, "WORK_DIR", tmp_path)
+
+    title = "test_slice_proj"
+    state_file = tmp_path / f"{title}_state.json"
+    state_file.write_text(
+        json.dumps({
+            "title": title,
+            "lines": [[{"text": "старый", "start": 1.0, "end": 2.0}]],
+            "editor_text": "[00:01.00 -> 00:02.00] старый",
+        }, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+    # 1. Align slice
+    res_align = client.post(
+        "/api/tools/slice-align",
+        json={
+            "title": title,
+            "start": 10.0,
+            "end": 13.0,
+            "text": "новый крутой вокал",
+            "mode": "syllables_rms",
+        }
+    )
+    assert res_align.status_code == 200
+    align_data = res_align.json()
+    assert align_data["status"] == "ok"
+    assert len(align_data["words"]) == 3
+
+    # 2. Apply slice
+    res_apply = client.post(
+        "/api/tools/slice-apply",
+        json={
+            "title": title,
+            "start": 10.0,
+            "end": 13.0,
+            "words": align_data["words"],
+        }
+    )
+    assert res_apply.status_code == 200
+    apply_data = res_apply.json()
+    assert apply_data["status"] == "applied"
+    assert "новый" in apply_data["editor_text"]
+
+
+def test_project_state_reconstruction_and_generation_params(tmp_path, monkeypatch):
+    from karaoke.api import routes
+    monkeypatch.setattr(routes, "WORK_DIR", tmp_path)
+
+    title = "test_params_proj"
+    state_file = tmp_path / f"{title}_state.json"
+    state_file.write_text(
+        json.dumps({
+            "title": title,
+            "lines": [[{"text": "Строка", "start": 1.0, "end": 2.0}]],
+            "editor_text": "[00:01.00 -> 00:02.00] Строка первая\n[00:03.00 -> 00:04.00] Строка вторая",
+        }, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+    response = client.get(f"/api/projects/{title}")
+    assert response.status_code == 200
+    data = response.json()
+    assert "reference_lyrics" in data
+    assert "Строка первая" in data["reference_lyrics"]
+    assert "Строка вторая" in data["reference_lyrics"]
+    assert "[" not in data["reference_lyrics"]  # timestamps stripped
+    assert "generation_params" in data
+    assert data["generation_params"]["model_size"] == "large-v3-turbo"
+
+
+def test_pipeline_generate_existing_project(tmp_path, monkeypatch):
+    from karaoke.api import routes
+    monkeypatch.setattr(routes, "WORK_DIR", tmp_path)
+
+    title = "test_regen_proj"
+    audio_file = tmp_path / f"{title}_source.wav"
+    audio_file.write_bytes(b"dummy audio data")
+
+    state_file = tmp_path / f"{title}_state.json"
+    state_file.write_text(
+        json.dumps({
+            "title": title,
+            "source_audio": str(audio_file),
+            "lines": [],
+            "editor_text": "",
+        }, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+    # Mock _run_generate_task so it doesn't actually run heavy AI models in test
+    called_args = []
+    def dummy_run_task(*args, **kwargs):
+        called_args.append(args)
+
+    monkeypatch.setattr(routes, "_run_generate_task", dummy_run_task)
+
+    response = client.post(
+        "/api/pipeline/generate",
+        data={
+            "existing_project_title": title,
+            "model_size": "bond005/whisper-podlodka-turbo",
+            "reference_lyrics": "Тестовый текст песни",
+            "use_ctc_align": "true",
+            "vad": "auditok",
+        }
+    )
+    assert response.status_code == 200
+    assert len(called_args) == 1
+    args = called_args[0]
+    # source should match audio_file
+    assert str(audio_file) in args[0]
+    assert args[1] == "bond005/whisper-podlodka-turbo"
+    assert args[4] == "Тестовый текст песни"
+    assert args[5] is True  # use_ctc_align
+
+
+
 

@@ -103,11 +103,9 @@ def build_macos_app_and_dmg() -> Path:
     print("🍎 Сборка AI Karaoke Studio.app и .DMG для macOS")
     print("==================================================")
 
-    # 1. Ensure frontend is built
-    dist_index = FRONTEND_DIR / "dist" / "index.html"
-    if not dist_index.exists():
-        print("📦 Компиляция фронтенда (npm run build)...")
-        subprocess.run(["npm", "run", "build"], cwd=str(FRONTEND_DIR), check=True)
+    # 1. Ensure frontend is built fresh
+    print("📦 Компиляция фронтенда (npm run build)...")
+    subprocess.run(["npm", "run", "build"], cwd=str(FRONTEND_DIR), check=True)
 
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     if APP_BUNDLE.exists():
@@ -129,8 +127,8 @@ def build_macos_app_and_dmg() -> Path:
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": "ru.karaokestudio.ai.app",
-        "CFBundleVersion": "0.4.0",
-        "CFBundleShortVersionString": "0.4.0",
+        "CFBundleVersion": "0.5.0",
+        "CFBundleShortVersionString": "0.5.0",
         "CFBundlePackageType": "APPL",
         "CFBundleExecutable": "AIKaraokeStudioLauncher",
         "CFBundleIconFile": "AppIcon.icns",

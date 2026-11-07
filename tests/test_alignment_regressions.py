@@ -31,14 +31,22 @@ def test_extra_reference_repeats_are_not_squeezed_before_next_anchor():
     chorus = "Водка и пивас полный расколбас"
     recognized = words(chorus, 110) + words("Дальше новый куплет", 112)
     reference = [chorus] * 4 + ["Дальше новый куплет"]
+
+    # When strict_repeats is True ("как сейчас"): mismatched repeats throw TimingAlignmentError and fallback to Whisper
     with pytest.raises(TimingAlignmentError):
-        align_words_to_reference_lines(recognized, reference)
+        align_words_to_reference_lines(recognized, reference, strict_repeats=True)
     warnings = []
-    lines = split_into_karaoke_lines([{"words": recognized}],
-                                    reference_lyrics="\n".join(reference), warnings_out=warnings)
+    lines_strict = split_into_karaoke_lines([{"words": recognized}],
+                                    reference_lyrics="\n".join(reference), warnings_out=warnings, strict_repeats=True)
     assert warnings
-    assert [w["text"] for line in lines for w in line] == [w["text"] for w in recognized]
-    validate_karaoke_lines(lines)
+    assert [w["text"] for line in lines_strict for w in line] == [w["text"] for w in recognized]
+    validate_karaoke_lines(lines_strict)
+
+    # When strict_repeats is False (default, "как было"): reference lyrics are NEVER discarded
+    lines_classic = split_into_karaoke_lines([{"words": recognized}],
+                                    reference_lyrics="\n".join(reference), strict_repeats=False)
+    assert len(lines_classic) == len(reference)
+    validate_karaoke_lines(lines_classic)
 
 
 def test_short_editor_windows_do_not_grow_into_next_line():
@@ -142,3 +150,138 @@ def test_split_long_editor_lines_splits_and_avoids_dangling_prepositions():
     assert flat[0]["start"] == long_line[0]["start"]
     assert flat[-1]["end"] == long_line[-1]["end"]
     validate_karaoke_lines(result)
+
+
+def test_reference_lyrics_with_dashes_and_whisper_substitutions_aligns_cleanly():
+    # User provides clean lyrics with dashes and rapid lines
+    reference = [
+        "От Урала до Байкала — лишнего мне мало",
+        "Транш из двух столиц,",
+        "Ещё айс-блонд...",
+        "Льётся спритц,",
+        "Как Блиц — Без границ.",
+    ]
+    # Recognizer produced garbled/mumbled words with fewer tokens
+    recognized = words("От Урала до Байкала лишнего мне мало", 10.0, 0.3)
+    recognized += words("Транш столетий я из блога", 12.5, 0.45)
+    recognized += words("Льется как блиц без границ", 14.5, 0.4)
+
+    aligned = align_words_to_reference_lines(recognized, reference)
+    assert len(aligned) == len(reference)
+    # Check that punctuation is attached and all lines are strictly monotonic
+    assert "Байкала —" in [w["text"] for w in aligned[0]]
+    validate_karaoke_lines(aligned)
+
+
+def test_find_vocal_offset_clamps_before_silence():
+    from karaoke.aligner import find_vocal_offset
+    import numpy as np
+    # 10s audio envelope: 0-3s active singing, 3-10s silent
+    hop_s = 0.01
+    rms = np.zeros(1000, dtype=np.float32)
+    rms[0:300] = 0.1  # active vocal
+    rms[300:1000] = 0.0001  # silence
+    offset = find_vocal_offset(rms, hop_s, search_start=1.0, search_end=9.5)
+    # Offset should clamp near 3.0s (+ 0.15s buffer), not stretch to 9.5s
+    assert 3.0 <= offset <= 3.3
+
+
+def test_long_instrumental_gap_does_not_stretch_interpolated_words():
+    # Gap between 12.0s and 45.0s (33 seconds of silence/solo)
+    recognized = [
+        {"text": "начало", "start": 10.0, "end": 12.0},
+        {"text": "конец", "start": 45.0, "end": 47.0}
+    ]
+    reference = [
+        "начало",
+        "пропущенная строка текста",
+        "конец"
+    ]
+    aligned = align_words_to_reference_lines(recognized, reference)
+    validate_karaoke_lines(aligned)
+    # The interpolated middle line must not stretch across all 33 seconds
+    mid_line = aligned[1]
+    mid_dur = mid_line[-1]["end"] - mid_line[0]["start"]
+    assert mid_dur < 10.0  # bounded by natural singing duration, not 33s
+
+
+def test_instrumental_intro_preserved_when_reference_lyrics_provided(tmp_path):
+    from karaoke.aligner import find_first_vocal_onset, refine_word_timestamps
+    import numpy as np
+    import soundfile as sf
+
+    sr = 16000
+    # 15s instrumental intro (silence in vocals stem) + 5s active vocal
+    audio = np.zeros(sr * 20, dtype=np.float32)
+    audio[sr * 15:] = 0.2
+    vocals_file = tmp_path / "vocals.wav"
+    sf.write(str(vocals_file), audio, sr)
+
+    # 1. find_first_vocal_onset detects intro
+    from karaoke.aligner import compute_vocal_rms_envelope
+    rms, hop_s = compute_vocal_rms_envelope(vocals_file)
+    first_onset = find_first_vocal_onset(rms, hop_s)
+    assert first_onset is not None
+    assert 14.8 <= first_onset <= 15.1
+
+    # 2. refine_word_timestamps drops Whisper hallucinations in intro
+    fake_whisper = {
+        "segments": [
+            # Hallucinated tokens during instrumental intro
+            {"start": 0.0, "end": 1.2, "text": "какой-то шум", "words": [{"text": "какой-то", "start": 0.0, "end": 0.6}, {"text": "шум", "start": 0.6, "end": 1.2}]},
+            {"start": 5.0, "end": 6.0, "text": "галлюцинация", "words": [{"text": "галлюцинация", "start": 5.0, "end": 6.0}]},
+            # Real singing starting at 15.0s
+            {"start": 14.5, "end": 18.0, "text": "настоящий куплет", "words": [{"text": "настоящий", "start": 14.5, "end": 16.0}, {"text": "куплет", "start": 16.0, "end": 18.0}]},
+        ]
+    }
+    refined = refine_word_timestamps(fake_whisper, vocals_path=vocals_file)
+    # The hallucinated segments during 0..14.8s must be purged
+    assert len(refined) == 1
+    assert refined[0]["words"][0]["text"] == "настоящий"
+    assert refined[0]["words"][0]["start"] >= 14.8
+
+    # 3. align_words_to_reference_lines preserves intro even if reference lyrics have extra lines
+    reference = [
+        "Вступительная строка из текста песни",
+        "Настоящий куплет",
+    ]
+    recognized = [{"text": "настоящий", "start": 15.0, "end": 16.0}, {"text": "куплет", "start": 16.0, "end": 18.0}]
+    aligned = align_words_to_reference_lines(recognized, reference, vocals_path=vocals_file)
+    validate_karaoke_lines(aligned)
+    # First line must NOT start at 0.0s during the intro
+    assert aligned[0][0]["start"] >= 14.8
+
+
+def test_repeated_chorus_places_omitted_repeats_into_audio_gap():
+    """
+    When a chorus repeats the same line 4 times (e.g. 23.2s..39.4s) and Whisper only outputs
+    the 1st repetition (23.2s..27.2s) before jumping to the next verse at 39.4s (which also starts with 'Я'),
+    the 3 omitted repetitions must be placed evenly inside the 27.2s..39.4s gap rather than squished before 24s.
+    """
+    recognized = (
+        words("Я пришел домой и опять лёг спать", 19.2, 0.55)
+        + words("Но я сегодня забыл повеситься", 23.23, 0.79)
+        + words("Я сходил в магазин и купил там пиво", 39.44, 0.46)
+    )
+    reference = [
+        "Я пришел домой и опять лёг спать",
+        "Но я сегодня забыл повеситься",
+        "Я сегодня забыл повеситься",
+        "Я сегодня забыл повеситься",
+        "Я сегодня забыл повеситься",
+        "Я сходил в магазин и купил там пиво",
+    ]
+    aligned = align_words_to_reference_lines(recognized, reference)
+    validate_karaoke_lines(aligned)
+    # Line 1 (first chorus line) matches 23.23..27.18
+    assert 23.0 <= aligned[1][0]["start"] <= 23.5
+    assert 26.8 <= aligned[1][-1]["end"] <= 27.5
+    # Lines 2, 3, 4 (omitted chorus repeats) fill the 27.18..39.44 gap (~4s each), NOT squished < 0.5s
+    for idx in (2, 3, 4):
+        dur = aligned[idx][-1]["end"] - aligned[idx][0]["start"]
+        assert dur >= 3.0, f"Chorus repeat {idx} was squished to {dur:.2f}s"
+    # Line 5 (next verse) starts at 39.44
+    assert aligned[5][0]["start"] >= 39.0
+
+
+

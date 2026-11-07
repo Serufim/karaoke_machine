@@ -1663,7 +1663,14 @@ def build_ui():
             with gr.Accordion("⚙️ Модели нейросетей & Свой текст", open=False):
                 model_dropdown = gr.Dropdown(
                     label="Распознавание речи (Whisper)",
-                    choices=WHISPER_MODELS,
+                    choices=[
+                        ("large-v3-turbo (Рекомендуется: быстрая, идеальна для песен, оперы, высоких нот)", "large-v3-turbo"),
+                        ("bond005/whisper-podlodka-turbo (Русский fine-tune Whisper Turbo)", "bond005/whisper-podlodka-turbo"),
+                        ("antony66/whisper-large-v3-russian (Русский fine-tune для обычной речи)", "antony66/whisper-large-v3-russian"),
+                        ("large-v3 (Базовая большая модель OpenAI)", "large-v3"),
+                        ("medium (Средняя модель)", "medium"),
+                        ("small (Быстрая легкая модель)", "small"),
+                    ],
                     value="large-v3-turbo",
                 )
                 demucs_dropdown = gr.Dropdown(
@@ -1682,9 +1689,10 @@ def build_ui():
                     value=False,
                 )
                 ref_lyrics_box = gr.Textbox(
-                    label="Вставьте текст песни из интернета (опционально)",
+                    label="Вставьте текст песни (опционально)",
                     placeholder="Если вставить текст песни до запуска, нейросеть разобьет куплеты строго по строкам...",
-                    lines=3,
+                    lines=8,
+                    max_lines=30,
                 )
 
             with gr.Row():

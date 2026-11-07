@@ -60,24 +60,51 @@ def compute_vocal_rms_envelope(
         return None, hop_s
 
 
+def find_first_vocal_onset(
+    rms: Optional[np.ndarray],
+    hop_s: float,
+    threshold_ratio: float = 0.08,
+    min_consecutive_frames: int = 4,
+) -> Optional[float]:
+    """
+    Finds the global first vocal onset in the isolated vocals audio.
+    Used to prevent hallucinated Whisper words or reference lyrics from appearing
+    during an instrumental intro before the singer actually starts singing.
+    """
+    if rms is None or len(rms) == 0:
+        return None
+    global_p90 = float(np.percentile(rms, 90)) if len(rms) > 0 else 0.0
+    if global_p90 < 0.005:
+        return None
+    thresh = max(0.008, global_p90 * threshold_ratio)
+    active = rms > thresh
+    for idx in range(len(active) - (min_consecutive_frames - 1)):
+        if all(active[idx + k] for k in range(min_consecutive_frames)):
+            onset = max(0.0, idx * hop_s - 0.07)
+            return round(onset, 2)
+    return None
+
+
 def find_vocal_onset(
     rms: Optional[np.ndarray],
     hop_s: float,
     search_start: float,
     search_end: float,
-    threshold_ratio: float = 0.08
+    threshold_ratio: float = 0.08,
+    fallback: Optional[float] = None,
 ) -> float:
     """
     Finds the actual start of singing within [search_start, search_end] using the vocal RMS envelope.
     Prevents the first word of a phrase from stretching back across an instrumental intro/solo.
     """
+    default_ret = fallback if fallback is not None else search_start
     if rms is None or len(rms) == 0 or search_end <= search_start + 0.35:
-        return search_start
+        return default_ret
 
     i_start = max(0, int(search_start / hop_s))
     i_end = min(len(rms), int(search_end / hop_s))
     if i_end <= i_start + 5:
-        return search_start
+        return default_ret
 
     window = rms[i_start:i_end]
     peak = float(np.percentile(window, 95)) if len(window) > 0 else 0.0
@@ -92,27 +119,79 @@ def find_vocal_onset(
             onset_time = (i_start + idx) * hop_s - 0.07
             return max(search_start, min(search_end - 0.15, onset_time))
 
-    return search_start
+    return default_ret
+
+
+def find_vocal_offset(
+    rms: Optional[np.ndarray],
+    hop_s: float,
+    search_start: float,
+    search_end: float,
+    threshold_ratio: float = 0.08,
+    min_silence_s: float = 0.5,
+) -> float:
+    """
+    Finds the actual end of singing within [search_start, search_end] using the vocal RMS envelope.
+    Prevents the trailing word of a phrase from stretching forward across an instrumental pause or solo.
+    """
+    if rms is None or len(rms) == 0 or search_end <= search_start + 0.35:
+        return search_end
+
+    i_start = max(0, int(search_start / hop_s))
+    i_end = min(len(rms), int(search_end / hop_s))
+    if i_end <= i_start + 5:
+        return search_end
+
+    window = rms[i_start:i_end]
+    global_p90 = float(np.percentile(rms, 90)) if len(rms) > 0 else 0.0
+    thresh = max(0.008, global_p90 * threshold_ratio)
+
+    silence_frames = int(min_silence_s / hop_s)
+    was_active = False
+    last_active_idx = 0
+    consecutive_silent = 0
+
+    for idx, val in enumerate(window):
+        if val > thresh:
+            was_active = True
+            last_active_idx = idx
+            consecutive_silent = 0
+        elif was_active:
+            consecutive_silent += 1
+            if consecutive_silent >= silence_frames:
+                offset_time = (i_start + last_active_idx + 1) * hop_s + 0.15
+                return min(search_end, max(search_start + 0.15, offset_time))
+
+    if was_active:
+        offset_time = (i_start + last_active_idx + 1) * hop_s + 0.15
+        return min(search_end, max(search_start + 0.15, offset_time))
+
+    return search_end
 
 
 def refine_word_timestamps(
     transcription_result: Dict[str, Any],
     vocals_path: Optional[Path] = None
 ) -> List[Dict[str, Any]]:
-    """
+    r"""
     Cleans and refines Whisper word timestamps:
     1. Strips [*] disfluency markers.
-    2. Clamps phrase starts to actual vocal energy onset in vocals.wav.
+    2. Clamps phrase starts and ends to actual vocal energy onset/offset in vocals.wav.
     3. Redistributes squashed word timestamps (e.g. 0.02s \kf2) proportionally to Russian syllables.
     Returns a list of refined segments, each containing a list of refined words.
     """
     rms, hop_s = compute_vocal_rms_envelope(vocals_path)
+    first_vocal_onset = find_first_vocal_onset(rms, hop_s)
     refined_segments = []
 
     raw_segments = transcription_result.get("segments", [])
     prev_seg_end = 0.0
 
     for seg in raw_segments:
+        # If an instrumental intro is present, purge any hallucinated segments before actual vocal onset
+        if first_vocal_onset is not None and float(seg.get("end", 0.0)) <= first_vocal_onset + 0.05:
+            continue
+
         raw_words = seg.get("words", [])
         clean_words = []
         for w in raw_words:
@@ -123,6 +202,14 @@ def refine_word_timestamps(
             w_end = float(w.get("end", w_start + 0.25))
             if w_end < w_start:
                 w_end = w_start + 0.15
+
+            # Filter hallucinated words that finish before vocal onset
+            if first_vocal_onset is not None and w_end <= first_vocal_onset:
+                continue
+            if first_vocal_onset is not None and w_start < first_vocal_onset:
+                w_start = first_vocal_onset
+                w_end = max(w_end, round(w_start + 0.15, 2))
+
             clean_words.append({
                 "text": txt,
                 "start": w_start,
@@ -133,16 +220,25 @@ def refine_word_timestamps(
         if not clean_words:
             continue
 
-        # 1. Clamp stretched first word using vocal RMS onset
+        # 1. Clamp stretched first and last word using vocal RMS onset and offset
         first_w = clean_words[0]
+        if first_vocal_onset is not None and first_w["start"] < first_vocal_onset:
+            first_w["start"] = first_vocal_onset
+
         if first_w["end"] - first_w["start"] > 0.75 or (first_w["start"] - prev_seg_end > 1.5):
             search_from = max(prev_seg_end, first_w["start"])
-            real_onset = find_vocal_onset(rms, hop_s, search_from, first_w["end"])
+            real_onset = find_vocal_onset(rms, hop_s, search_from, first_w["end"], fallback=first_w["start"])
             if real_onset > first_w["start"] + 0.15:
                 first_w["start"] = round(real_onset, 2)
 
+        last_w = clean_words[-1]
+        if last_w["end"] - last_w["start"] > 0.75:
+            real_offset = find_vocal_offset(rms, hop_s, last_w["start"], last_w["end"])
+            if real_offset < last_w["end"] - 0.2:
+                last_w["end"] = round(real_offset, 2)
+
         # Also check subsequent words inside the segment that stretched across mid-segment pauses
-        for idx in range(1, len(clean_words)):
+        for idx in range(1, len(clean_words) - 1):
             w_curr = clean_words[idx]
             w_prev = clean_words[idx - 1]
             if w_curr["end"] - w_curr["start"] > 1.2:
@@ -233,6 +329,11 @@ def align_russian_ctc_on_segments(
         import torch
         import torchaudio
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+        try:
+            import transformers.utils.import_utils as tr_utils
+            tr_utils.check_torch_load_is_safe = lambda: None
+        except Exception:
+            pass
 
         model_id = "jonatasgrosman/wav2vec2-large-xlsr-53-russian"
         print(f"[Karaoke] Running Cyrillic Wav2Vec2 CTC forced alignment ({model_id})...")
@@ -517,6 +618,8 @@ def split_into_karaoke_lines(
     max_chars_per_line: int = 48,
     reference_lyrics: Optional[str] = None,
     warnings_out: Optional[List[str]] = None,
+    vocals_path: Optional[Path] = None,
+    strict_repeats: bool = False,
 ) -> List[List[Dict[str, Any]]]:
     """
     Splits refined segments into natural poetic karaoke lines.
@@ -540,7 +643,12 @@ def split_into_karaoke_lines(
         ref_lines = [line.strip() for line in reference_lyrics.splitlines() if line.strip() and not line.strip().startswith("[")]
         if ref_lines:
             try:
-                aligned = align_words_to_reference_lines(all_words, ref_lines)
+                aligned = align_words_to_reference_lines(
+                    all_words,
+                    ref_lines,
+                    vocals_path=vocals_path,
+                    strict_repeats=strict_repeats,
+                )
                 if aligned:
                     return aligned
             except TimingAlignmentError as exc:
@@ -579,26 +687,51 @@ def _normalize_word(text: str) -> str:
     return re.sub(r"[^\wа-яёa-z]", "", text.lower().replace("ё", "е"))
 
 
-def _sequence_opcodes(reference: List[str], recognized: List[str]):
+def _sequence_opcodes(
+    reference: List[str],
+    recognized: List[str],
+    recognized_words: Optional[List[Dict[str, Any]]] = None,
+):
     """Minimum-edit monotonic alignment; repeated choruses cannot steal anchors.
 
     SequenceMatcher chooses the longest exact block, even if it skips an earlier
-    chorus. Dynamic programming instead minimizes edits over the entire sequence.
+    chorus. Dynamic programming instead minimizes edits over the entire sequence,
+    preferring earliest reference matches on identical repeats and placing deleted
+    reference words into real audio time gaps.
     """
     n, m = len(reference), len(recognized)
     trace = np.zeros((n + 1, m + 1), dtype=np.uint8)
     trace[1:, 0] = 1
     trace[0, 1:] = 2
-    previous = [3 * j for j in range(m + 1)]
+    # Deletion cost at column j (between recognized[j-1] and recognized[j]):
+    # Slightly cheaper when there is a real pause/gap in recognized timestamps where Whisper missed repeated lines,
+    # and slightly more expensive between back-to-back words so contiguous phrases aren't torn apart.
+    del_costs = [3.0] * (m + 1)
+    if recognized_words and len(recognized_words) == m:
+        for j in range(1, m):
+            gap = float(recognized_words[j].get("start", 0.0)) - float(recognized_words[j - 1].get("end", 0.0))
+            if gap >= 1.2:
+                del_costs[j] = 2.85
+            elif gap < 0.15:
+                del_costs[j] = 3.05
+
+    # Costs: insert 2.0 (cheap to skip extra repeated audio), delete ~3.0, replace 2.5, equal 0.0
+    previous = [2.0 * j for j in range(m + 1)]
     for i in range(1, n + 1):
-        current = [3 * i] + [0] * m
+        current = [3.0 * i] + [0.0] * m
         for j in range(1, m + 1):
-            costs = (previous[j - 1] + (0 if reference[i - 1] == recognized[j - 1] else 2),
-                     previous[j] + 3, current[j - 1] + 3)
+            is_eq = (reference[i - 1] == recognized[j - 1])
+            pos_tie = 1e-4 * i if is_eq else 0.0
+            costs = (
+                previous[j - 1] + (0.0 if is_eq else 2.5) + pos_tie,
+                previous[j] + del_costs[j],
+                current[j - 1] + 2.0,
+            )
             direction = min(range(3), key=costs.__getitem__)
             current[j] = costs[direction]
             trace[i, j] = direction
         previous = current
+
     actions = []
     i, j = n, m
     while i or j:
@@ -613,21 +746,24 @@ def _sequence_opcodes(reference: List[str], recognized: List[str]):
         else:
             actions.append("insert")
             j -= 1
+
+    actions.reverse()
+
+    # Group consecutive actions of the exact same kind without merging distinct operations
     i = j = 0
     group = None
-    for action in reversed(actions):
-        kind = "equal" if action == "equal" else "edit"
-        if group and group[0] != kind:
+    for action in actions:
+        if group and group[0] != action:
             tag, a, b = group
-            yield ("equal" if tag == "equal" else "replace" if i > a and j > b else "delete" if i > a else "insert", a, i, b, j)
+            yield (tag, a, i, b, j)
             group = None
         if group is None:
-            group = (kind, i, j)
-        i += action != "insert"
-        j += action != "delete"
+            group = (action, i, j)
+        i += (action != "insert")
+        j += (action != "delete")
     if group:
         tag, a, b = group
-        yield ("equal" if tag == "equal" else "replace" if i > a and j > b else "delete" if i > a else "insert", a, i, b, j)
+        yield (tag, a, i, b, j)
 
 
 def _distribute_words(tokens: List[str], start: float, end: float) -> List[Dict[str, Any]]:
@@ -647,7 +783,9 @@ def _distribute_words(tokens: List[str], start: float, end: float) -> List[Dict[
 
 def align_words_to_reference_lines(
     recognized_words: List[Dict[str, Any]],
-    ref_lines: List[str]
+    ref_lines: List[str],
+    vocals_path: Optional[Path] = None,
+    strict_repeats: bool = False,
 ) -> List[List[Dict[str, Any]]]:
     """
     Maps a user's reference lyric lines to the recognized word timestamps using fuzzy sequence alignment.
@@ -656,27 +794,37 @@ def align_words_to_reference_lines(
     flat_ref: List[Tuple[int, str, str]] = []  # (line_idx, raw_word, normalized_word)
 
     for l_idx, line_str in enumerate(ref_lines):
-        tokens = [t for t in line_str.split() if t.strip()]
+        raw_tokens = [t for t in line_str.split() if t.strip()]
+        if not raw_tokens:
+            continue
+        # Merge standalone punctuation tokens (e.g. "—", "-", "...") to the preceding word
+        tokens: List[str] = []
+        for t in raw_tokens:
+            if re.sub(r"[^\wа-яёa-z]", "", t.lower()):
+                tokens.append(t)
+            elif tokens:
+                tokens[-1] += f" {t}"
+            else:
+                tokens.append(t)
         if not tokens:
             continue
         ref_tokenized.append(tokens)
         actual_l_idx = len(ref_tokenized) - 1
         for t in tokens:
-            norm = re.sub(r"[^\wа-яёa-z]", "", t.lower().replace("ё", "е"))
+            norm = _normalize_word(t)
             flat_ref.append((actual_l_idx, t, norm))
 
     if not flat_ref or not recognized_words:
         return []
 
-    rec_norms = [
-        re.sub(r"[^\wа-яёa-z]", "", w["text"].lower().replace("ё", "е"))
-        for w in recognized_words
-    ]
+    rms, hop_s = compute_vocal_rms_envelope(vocals_path)
+
+    rec_norms = [_normalize_word(w["text"]) for w in recognized_words]
     ref_norms = [item[2] for item in flat_ref]
 
     ref_to_time: List[Optional[Tuple[float, float]]] = [None] * len(flat_ref)
 
-    for tag, i1, i2, j1, j2 in _sequence_opcodes(ref_norms, rec_norms):
+    for tag, i1, i2, j1, j2 in _sequence_opcodes(ref_norms, rec_norms, recognized_words):
         if tag == "equal":
             for offset in range(i2 - i1):
                 rw = recognized_words[j1 + offset]
@@ -687,8 +835,16 @@ def align_words_to_reference_lines(
             sylls = [count_syllables(flat_ref[k][1]) for k in range(i1, i2)]
             tot_syll = max(1, sum(sylls))
             dur = win_end - win_start
-            if i2 - i1 > j2 - j1 + 3 or dur < 0.06 * (i2 - i1):
-                raise TimingAlignmentError("В готовом тексте есть лишние повторы или слишком много слов для распознанного интервала.")
+            if dur < 0.06 * (i2 - i1):
+                if strict_repeats:
+                    raise TimingAlignmentError("В готовом тексте есть лишние повторы или слишком много слов для распознанного интервала.")
+                dur = max(dur, 0.06 * (i2 - i1))
+                win_end = max(win_end, win_start + dur)
+            # Bound replacement duration to prevent smearing across omitted audio sections
+            max_natural_dur = tot_syll * 0.85
+            if dur > max_natural_dur and strict_repeats:
+                win_end = win_start + max_natural_dur
+                dur = win_end - win_start
             cur = win_start
             for idx_k, k in enumerate(range(i1, i2)):
                 step = dur * (sylls[idx_k] / tot_syll)
@@ -705,18 +861,106 @@ def align_words_to_reference_lines(
             end_none = idx
             while end_none + 1 < n_ref and ref_to_time[end_none + 1] is None:
                 end_none += 1
-            left_t = ref_to_time[idx - 1][1] if idx > 0 and ref_to_time[idx - 1] else total_rec_start
-            right_t = ref_to_time[end_none + 1][0] if end_none + 1 < n_ref and ref_to_time[end_none + 1] else total_rec_end
             count = end_none - idx + 1
-            if count > 3 or right_t - left_t < 0.06 * count:
-                raise TimingAlignmentError(
-                    "Не удалось привязать готовый текст к вокалу: лишние повторы или пропущенные слова. "
-                    "Нужны тайминги по аудио; сдвигать следующие строки автоматически нельзя."
-                )
+            has_left = idx > 0 and ref_to_time[idx - 1] is not None
+            has_right = end_none + 1 < n_ref and ref_to_time[end_none + 1] is not None
+
+            if has_left:
+                left_s, left_e = ref_to_time[idx - 1]
+            else:
+                first_onset = find_first_vocal_onset(rms, hop_s)
+                if first_onset is not None:
+                    # Never start earlier than actual first vocal onset in audio.
+                    # Bound natural duration so it clusters near total_rec_start, preserving instrumental intro.
+                    dur_needed = count * 0.75
+                    left_s = left_e = max(first_onset, total_rec_start - dur_needed)
+                else:
+                    left_s = left_e = total_rec_start
+
+            if has_right:
+                r_start = end_none + 1
+                if count >= 3:
+                    r_line = flat_ref[r_start][0]
+                    stretch_k = None
+                    for k_r in range(r_start, min(n_ref, r_start + 6)):
+                        if flat_ref[k_r][0] != r_line or ref_to_time[k_r] is None:
+                            break
+                        ws_r, we_r = ref_to_time[k_r]
+                        sy_r = count_syllables(flat_ref[k_r][1])
+                        if we_r - ws_r > max(1.4, sy_r * 0.85):
+                            stretch_k = k_r
+                    if stretch_k is not None:
+                        _, anchor_end = ref_to_time[stretch_k]
+                        pref_sylls = [count_syllables(flat_ref[k_r][1]) for k_r in range(r_start, stretch_k + 1)]
+                        pref_dur = sum(pref_sylls) * 0.25
+                        new_r_start = max(left_e + 0.5, anchor_end - pref_dur)
+                        if new_r_start > ref_to_time[r_start][0] + 1.0:
+                            cur_r = new_r_start
+                            for idx_r, k_r in enumerate(range(r_start, stretch_k + 1)):
+                                step_r = (anchor_end - new_r_start) * (pref_sylls[idx_r] / max(1, sum(pref_sylls)))
+                                ref_to_time[k_r] = (round(cur_r, 2), round(cur_r + step_r, 2))
+                                cur_r += step_r
+                right_s, right_e = ref_to_time[end_none + 1]
+            else:
+                audio_end = len(rms) * hop_s if rms is not None and len(rms) > 0 else total_rec_end
+                right_s = right_e = max(total_rec_end, audio_end - 1.0)
+
+            gap = right_s - left_e
+            min_needed = 0.08 * count
+
+            if gap < min_needed:
+                needed = min_needed - max(0.0, gap)
+                borrow_l = min((left_e - left_s) * 0.45, needed * 0.5) if has_left else 0.0
+                borrow_r = min((right_e - right_s) * 0.45, needed * 0.5) if has_right else 0.0
+                if not has_left:
+                    borrow_r = min((right_e - right_s) * 0.45, needed)
+                if not has_right:
+                    borrow_l = min((left_e - left_s) * 0.45, needed)
+
+                if has_left and borrow_l > 0:
+                    left_e -= borrow_l
+                    ref_to_time[idx - 1] = (round(left_s, 2), round(left_e, 2))
+                if has_right and borrow_r > 0:
+                    right_s += borrow_r
+                    ref_to_time[end_none + 1] = (round(right_s, 2), round(right_e, 2))
+
+            dur = right_s - left_e
             sylls = [count_syllables(flat_ref[k][1]) for k in range(idx, end_none + 1)]
             tot_s = max(1, sum(sylls))
-            dur = right_t - left_t
-            cur = left_t
+
+            # Guard against stretching words across long instrumental pauses
+            if dur > 2.5:
+                # If vocals envelope is available, detect actual vocal activity within the gap
+                if rms is not None and len(rms) > 0:
+                    sub_onset = find_vocal_onset(rms, hop_s, left_e, right_s, fallback=left_e)
+                    sub_offset = find_vocal_offset(rms, hop_s, sub_onset, right_s)
+                    if sub_offset > sub_onset + 0.3:
+                        left_e = sub_onset
+                        right_s = sub_offset
+                        dur = right_s - left_e
+
+                # Natural singing tempo limit: maximum ~0.75s per syllable
+                max_natural_dur = tot_s * 0.75
+                if dur > max_natural_dur:
+                    if has_left and not has_right:
+                        right_s = left_e + max_natural_dur
+                    elif has_right and not has_left:
+                        first_onset = find_first_vocal_onset(rms, hop_s)
+                        min_start = first_onset if first_onset is not None else total_rec_start
+                        left_e = max(min_start, right_s - max_natural_dur)
+                    else:
+                        right_s = min(right_s, left_e + max_natural_dur)
+                    dur = right_s - left_e
+
+            if dur < (0.08 if strict_repeats else 0.05) * count:
+                if strict_repeats:
+                    raise TimingAlignmentError(
+                        "Не удалось привязать готовый текст к вокалу: лишние повторы или пропущенные слова. "
+                        "Нужны тайминги по аудио; сдвигать следующие строки автоматически нельзя."
+                    )
+                dur = max(0.06 * count, dur)
+                right_s = max(right_s, left_e + dur)
+            cur = left_e
             for idx_k, k in enumerate(range(idx, end_none + 1)):
                 step = dur * (sylls[idx_k] / tot_s)
                 ref_to_time[k] = (round(cur, 2), round(cur + step, 2))
@@ -724,6 +968,20 @@ def align_words_to_reference_lines(
             idx = end_none + 1
         else:
             idx += 1
+
+    # Enforce strict forward monotonicity and positive non-zero word durations
+    first_vocal_onset = find_first_vocal_onset(rms, hop_s)
+    prev_end = first_vocal_onset if first_vocal_onset is not None else 0.0
+    for k in range(len(ref_to_time)):
+        if ref_to_time[k] is None:
+            continue
+        s, e = ref_to_time[k]
+        if s < prev_end:
+            s = prev_end
+        if e <= s:
+            e = round(s + 0.08, 2)
+        ref_to_time[k] = (round(s, 2), round(e, 2))
+        prev_end = e
 
     # Group back into lines
     grouped_lines: List[List[Dict[str, Any]]] = [[] for _ in range(len(ref_tokenized))]
@@ -839,7 +1097,8 @@ def align_words_in_line_window(
 
 def editor_text_to_lines(
     editor_text: str,
-    original_lines: Optional[List[List[Dict[str, Any]]]] = None
+    original_lines: Optional[List[List[Dict[str, Any]]]] = None,
+    vocals_path: Optional[Path] = None,
 ) -> List[List[Dict[str, Any]]]:
     """
     Parses the user's edited text from the Lyrics Editor back into word-timed karaoke lines.
@@ -875,7 +1134,11 @@ def editor_text_to_lines(
 
     # If the user pasted completely raw lyrics without any [MM:SS -> MM:SS], align to cached_words
     if not any_timestamps and cached_words:
-        return align_words_to_reference_lines(cached_words, [r["text"] for r in parsed_rows])
+        return align_words_to_reference_lines(
+            cached_words,
+            [r["text"] for r in parsed_rows],
+            vocals_path=vocals_path,
+        )
 
     # Interpolate timestamps for lines where user pressed Enter to split a line without typing [start -> end]
     n_rows = len(parsed_rows)
@@ -887,7 +1150,8 @@ def editor_text_to_lines(
                 j += 1
             # If the previous line had a timestamp and the user split its second half onto a new line,
             # share the previous line's duration proportionally if next line starts immediately after!
-            left_t = parsed_rows[i - 1]["end"] if i > 0 and parsed_rows[i - 1]["end"] is not None else 0.0
+            default_start = cached_words[0]["start"] if cached_words else 0.0
+            left_t = parsed_rows[i - 1]["end"] if i > 0 and parsed_rows[i - 1]["end"] is not None else default_start
             right_t = parsed_rows[j + 1]["start"] if j + 1 < n_rows and parsed_rows[j + 1]["start"] is not None else left_t + 3.0 * (j - i + 1)
 
             if i > 0 and right_t - left_t < 0.4:

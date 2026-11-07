@@ -1,12 +1,12 @@
 [project]
 name = "karaoke-generator"
-version = "0.4.1"
+version = "0.5.0"
 description = "Fully local, automatic AI karaoke video generator optimized for Russian/Cyrillic"
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
 dependencies = [
-    "torch>=2.2.0",
-    "torchaudio>=2.2.0",
+    "torch>=2.2.0,<2.3.0",
+    "torchaudio>=2.2.0,<2.3.0",
     "demucs>=4.0.1",
     "whisper-timestamped>=1.15.4",
     "transformers>=4.40.0,<5.0.0",

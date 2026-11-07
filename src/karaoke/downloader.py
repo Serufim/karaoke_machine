@@ -15,8 +15,9 @@ def sanitize_filename(name: str) -> str:
 
 
 def is_url(source: str) -> bool:
-    """Checks if input string is a valid web URL."""
-    return source.startswith("http://") or source.startswith("https://")
+    """Checks if input string is a valid web URL or ytsearch query."""
+    s = str(source).strip()
+    return s.startswith("http://") or s.startswith("https://") or s.startswith("ytsearch")
 
 
 def find_ffmpeg_bin() -> str:
@@ -241,7 +242,11 @@ def get_audio_from_source(
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(source, download=True)
                 check_cancelled()
-                title = info.get('title', 'downloaded_song')
+                if info and "entries" in info:
+                    entries = [e for e in info.get("entries", []) if e]
+                    if entries:
+                        info = entries[0]
+                title = info.get('title', 'downloaded_song') if info else 'downloaded_song'
                 sanitized = sanitize_filename(title)
 
                 if download_video:
@@ -302,6 +307,8 @@ def get_audio_from_source(
         if not file_path.exists():
             raise FileNotFoundError(f"Source file not found: {source}")
         title = sanitize_filename(file_path.stem)
+        while title.endswith("_source"):
+            title = title[:-7]
         target_cover = output_dir / f"{title}_cover.png"
         metadata = probe_media(file_path, find_ffmpeg_bin())
         is_video = bool(video_streams(metadata))
@@ -333,5 +340,11 @@ def get_audio_from_source(
                     pass
             return wav_path, title, cover_path, video_bg_path
         else:
+            # Ensure persistent copy in output_dir so temporary uploads outside output_dir are never lost
+            if file_path.parent.resolve() != output_dir.resolve():
+                persistent_audio = output_dir / f"{title}_source{file_path.suffix.lower()}"
+                if file_path.resolve() != persistent_audio.resolve() and not persistent_audio.exists():
+                    shutil.copy2(file_path, persistent_audio)
+                    file_path = persistent_audio
             cover_path = extract_cover_art(file_path, target_cover)
             return file_path, title, cover_path, None

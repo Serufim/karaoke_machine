@@ -7,16 +7,64 @@ import MediaStage from '@/components/MediaStage.vue'
 import LyricsInspector from '@/components/LyricsInspector.vue'
 import StudioTimeline from '@/components/StudioTimeline.vue'
 import NewProjectModal from '@/components/NewProjectModal.vue'
+import type { EditProjectInitialData } from '@/components/NewProjectModal.vue'
 import ExportModal from '@/components/ExportModal.vue'
 import ProgressModal from '@/components/ProgressModal.vue'
 import ModelManagerModal from '@/components/ModelManagerModal.vue'
+import ChartsModal from '@/components/ChartsModal.vue'
+import type { ChartTrack } from '@/types'
 
 const projectStore = useProjectStore()
 const pipelineStore = usePipelineStore()
 
 const showNewModal = ref(false)
+const modalMode = ref<'create' | 'edit'>('create')
+const editProjectData = ref<EditProjectInitialData | null>(null)
 const showExportModal = ref(false)
 const showModelsModal = ref(false)
+const showChartsModal = ref(false)
+const prefilledQuery = ref('')
+const prefilledCoverUrl = ref('')
+
+function onOpenNewModal() {
+  modalMode.value = 'create'
+  editProjectData.value = null
+  prefilledQuery.value = ''
+  prefilledCoverUrl.value = ''
+  showNewModal.value = true
+}
+
+function onOpenEditParamsModal() {
+  if (!projectStore.currentProject) return
+  const p = projectStore.currentProject
+  modalMode.value = 'edit'
+  editProjectData.value = {
+    projectTitle: p.title,
+    source: p.source || '',
+    sourceType: p.source_type || 'file',
+    referenceLyrics: p.reference_lyrics || '',
+    coverPreviewUrl: (p.cover_image || p.custom_bg) ? `/api/media/${encodeURIComponent(p.title)}/cover?t=${projectStore.coverTimestamp}` : '',
+    modelSize: p.generation_params?.model_size || 'large-v3-turbo',
+    demucsModel: p.generation_params?.demucs_model || 'htdemucs',
+    vadModel: p.generation_params?.vad || 'auditok',
+    useCtcAlign: p.generation_params?.use_ctc_align ?? false,
+    useVideoBg: p.generation_params?.use_video_bg ?? !!p.video_bg,
+    conditionOnPreviousText: p.generation_params?.condition_on_previous_text ?? false,
+    strictRepeats: p.generation_params?.strict_repeats ?? false,
+    vocalVolumePct: p.generation_params?.vocal_volume_pct ?? 0,
+    numLines: p.generation_params?.num_lines ?? 4,
+  }
+  showNewModal.value = true
+}
+
+function onTrackSelectedFromCharts(track: ChartTrack) {
+  showChartsModal.value = false
+  modalMode.value = 'create'
+  editProjectData.value = null
+  prefilledQuery.value = track.search_query
+  prefilledCoverUrl.value = track.cover_url || ''
+  showNewModal.value = true
+}
 
 // Resizable panel dimensions with persistence
 const defaultLyricsWidth = 340
@@ -86,9 +134,11 @@ onUnmounted(() => {
   <div class="h-screen w-screen flex flex-col bg-studio-bg overflow-hidden text-studio-text select-none">
     <!-- Top Bar -->
     <StudioHeader
-      @open-new="showNewModal = true"
+      @open-new="onOpenNewModal"
+      @open-edit-params="onOpenEditParamsModal"
       @open-export="showExportModal = true"
       @open-models="showModelsModal = true"
+      @open-charts="showChartsModal = true"
     />
 
     <!-- Middle Workspace: Media Player + Splitter + Lyrics Inspector -->
@@ -138,8 +188,19 @@ onUnmounted(() => {
     <!-- Modals -->
     <NewProjectModal
       v-if="showNewModal"
+      :mode="modalMode"
+      :initial-data="editProjectData"
+      :initial-query="prefilledQuery"
+      :initial-cover-url="prefilledCoverUrl"
       @close="showNewModal = false"
       @open-models="showModelsModal = true"
+      @open-charts="showNewModal = false; showChartsModal = true"
+    />
+
+    <ChartsModal
+      v-if="showChartsModal"
+      @close="showChartsModal = false"
+      @select-track="onTrackSelectedFromCharts"
     />
 
     <ExportModal

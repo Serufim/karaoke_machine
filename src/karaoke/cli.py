@@ -2,8 +2,9 @@ import argparse
 import json
 import tempfile
 import hashlib
+import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Union
 
 from karaoke.downloader import get_audio_from_source, ensure_project_cover
 from karaoke.separator import separate_stems, DEMUCS_MODELS
@@ -37,6 +38,11 @@ def analyze_and_transcribe(
     download_video: bool = False,
     cookies_browser: Optional[str] = "chrome",
     cookies_file: Optional[Path] = None,
+    custom_cover: Optional[Union[str, Path]] = None,
+    custom_bg: Optional[Union[str, Path]] = None,
+    condition_on_previous_text: bool = False,
+    vad: Optional[str] = "auditok",
+    strict_repeats: bool = False,
     progress_callback=None,
 ) -> Dict[str, Any]:
     """
@@ -86,7 +92,24 @@ def analyze_and_transcribe(
                 finally:
                     Path(copy_name).unlink(missing_ok=True)
             video_bg = stored_video.resolve()
-    if not cover_path:
+
+    custom_bg_path = None
+    if custom_bg and Path(custom_bg).exists():
+        custom_bg_p = Path(custom_bg).resolve()
+        dest_bg = work_dir / f"{title}_custom_bg{custom_bg_p.suffix.lower()}"
+        if custom_bg_p != dest_bg:
+            shutil.copy2(custom_bg_p, dest_bg)
+        custom_bg_path = dest_bg
+
+    if custom_cover and Path(custom_cover).exists():
+        custom_cover_p = Path(custom_cover).resolve()
+        dest_cover = work_dir / f"{title}_cover{custom_cover_p.suffix.lower()}"
+        if custom_cover_p != dest_cover:
+            shutil.copy2(custom_cover_p, dest_cover)
+        cover_path = dest_cover
+    elif custom_bg_path:
+        cover_path = custom_bg_path
+    elif not cover_path:
         cover_path = ensure_project_cover(title, work_dir)
     cover_edge_colors = extract_cover_edge_colors(cover_path)
 
@@ -104,8 +127,10 @@ def analyze_and_transcribe(
         model_size=model_size,
         language=language,
         device=device,
-        initial_prompt=reference_lyrics,
+        initial_prompt=None,  # Do not feed sequential lyrics as initial_prompt to prevent Whisper intro hallucinations
         use_ctc_align=use_ctc_align,
+        condition_on_previous_text=condition_on_previous_text,
+        vad=vad,
     )
 
     alignment_warnings = []
@@ -113,6 +138,8 @@ def analyze_and_transcribe(
         transcription.get("segments", []),
         reference_lyrics=reference_lyrics,
         warnings_out=alignment_warnings,
+        vocals_path=vocals_wav,
+        strict_repeats=strict_repeats,
     )
     validate_karaoke_lines(lines)
     editor_text = lines_to_editor_text(lines)
@@ -127,12 +154,28 @@ def analyze_and_transcribe(
     state_path = work_dir / f"{title}_state.json"
     state_data = {
         "title": title,
+        "source": source,
+        "source_type": "url" if str(source).startswith(("http://", "https://", "ytsearch")) else "file",
+        "source_audio": str(raw_audio.resolve()) if raw_audio and Path(raw_audio).exists() else None,
+        "reference_lyrics": reference_lyrics or "",
+        "generation_params": {
+            "model_size": model_size,
+            "demucs_model": demucs_model,
+            "language": language,
+            "vad": vad,
+            "use_ctc_align": use_ctc_align,
+            "use_video_bg": bool(video_bg) if not custom_bg_path else False,
+            "condition_on_previous_text": condition_on_previous_text,
+            "strict_repeats": strict_repeats,
+        },
         "vocals_wav": str(vocals_wav),
         "no_vocals_wav": str(no_vocals_wav),
         "cover_image": str(cover_path) if cover_path else None,
         "cover_edge_colors": cover_edge_colors,
+        "custom_bg": str(custom_bg_path) if custom_bg_path else None,
         "video_bg": str(video_bg) if video_bg else None,
-        "use_video_bg": bool(video_bg),
+        "use_video_bg": bool(video_bg) if not custom_bg_path else False,
+        "use_cover_bg": False if custom_bg_path else True,
         "lines": lines,
         "editor_text": editor_text,
         "alignment_warnings": alignment_warnings,
@@ -204,7 +247,7 @@ def render_from_state(
         state_data["cover_edge_colors"] = cover_edge_colors
 
     if editor_text and editor_text.strip():
-        lines = editor_text_to_lines(editor_text, original_lines=original_lines)
+        lines = editor_text_to_lines(editor_text, original_lines=original_lines, vocals_path=vocals_wav)
     else:
         lines = original_lines
 
@@ -243,6 +286,8 @@ def render_from_state(
         if not candidate_bg.exists():
             raise FileNotFoundError("Исходное видео проекта недоступно. Выберите замену в поле «Свой фон».")
         background = candidate_bg
+    elif background is None and state_data.get("custom_bg") and Path(state_data["custom_bg"]).exists() and not use_cover_bg:
+        background = Path(state_data["custom_bg"])
 
     has_cover_card = bool(use_cover_bg and cover_image and cover_image.exists() and not (background and Path(background).exists()))
 

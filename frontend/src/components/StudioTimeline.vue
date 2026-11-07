@@ -5,12 +5,14 @@ import { usePlayerStore } from '@/stores/player'
 import type { VocalInterval, FxInterval, EmojiInterval } from '@/types'
 import EffectsMenuModal from './EffectsMenuModal.vue'
 import EmojiBurstModal from './EmojiBurstModal.vue'
+import ManualAlignModal from './ManualAlignModal.vue'
 import {
   VolumeX,
   Volume1,
   Volume2,
   SmilePlus,
   Palette,
+  Wand2,
   Trash2,
 } from 'lucide-vue-next'
 
@@ -22,6 +24,15 @@ const scrollContainerRef = ref<HTMLDivElement | null>(null)
 
 const showFxModal = ref(false)
 const showEmojiModal = ref(false)
+const showManualModal = ref(false)
+
+function openManualModal() {
+  if (playerStore.selStart === null || playerStore.selEnd === null) {
+    const cur = Number((playerStore.currentTime || 0).toFixed(2))
+    playerStore.setSelection(cur, Number((cur + 5.0).toFixed(2)))
+  }
+  showManualModal.value = true
+}
 
 const zoomFactor = ref<number>(1)
 const logicalWidth = ref<number>(1200)
@@ -914,6 +925,15 @@ onUnmounted(() => {
           <span>Салют эмодзи</span>
         </button>
 
+        <button
+          @click="openManualModal"
+          class="flex items-center space-x-1.5 px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white font-medium shadow-sm transition-colors"
+          title="Мануальный режим: точечное выравнивание и сборка превью куска видео"
+        >
+          <Wand2 class="w-3.5 h-3.5" />
+          <span>Мануальный режим</span>
+        </button>
+
         <div class="h-4 w-px bg-studio-border mx-1"></div>
 
         <span class="text-studio-muted font-medium">Вокал:</span>
@@ -1047,6 +1067,14 @@ onUnmounted(() => {
       @close="showEmojiModal = false"
       @apply="onApplyEmoji"
       @remove="onRemoveEmoji"
+    />
+
+    <ManualAlignModal
+      v-if="showManualModal"
+      :initial-start="Math.min(playerStore.selStart ?? 0, playerStore.selEnd ?? 5)"
+      :initial-end="Math.max(playerStore.selStart ?? 0, playerStore.selEnd ?? 5)"
+      @close="showManualModal = false"
+      @applied="draw()"
     />
   </div>
 </template>
