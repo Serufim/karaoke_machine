@@ -28,10 +28,11 @@ const hasVideoFile = computed(() => {
 const videoUrl = computed(() => {
   if (!projectStore.currentProject?.title) return ''
   const titleEnc = encodeURIComponent(projectStore.currentProject.title)
+  const ts = Math.max(mediaCacheBuster.value, projectStore.mediaTimestamp || 0)
   if (hasVideoFile.value) {
-    return `/api/media/${titleEnc}/video?t=${mediaCacheBuster.value}`
+    return `/api/media/${titleEnc}/video?t=${ts}`
   }
-  return `/api/media/${titleEnc}/instrumental?t=${mediaCacheBuster.value}`
+  return `/api/media/${titleEnc}/instrumental?t=${ts}`
 })
 
 const vocalsUrl = computed(() => {
@@ -131,6 +132,27 @@ watch(
     if (newTitle !== oldTitle || newHasVideo !== oldHasVideo) {
       mediaCacheBuster.value = Date.now()
       playerStore.resetForNewProject()
+      await nextTick()
+      if (videoRef.value) {
+        try {
+          videoRef.value.load()
+        } catch (_) {}
+      }
+      if (audioRef.value) {
+        try {
+          audioRef.value.load()
+        } catch (_) {}
+      }
+      playerStore.bindMedia(videoRef.value, audioRef.value)
+    }
+  }
+)
+
+watch(
+  () => projectStore.mediaTimestamp,
+  async (newTs, oldTs) => {
+    if (newTs && newTs !== oldTs) {
+      mediaCacheBuster.value = newTs
       await nextTick()
       if (videoRef.value) {
         try {

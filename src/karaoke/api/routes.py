@@ -20,6 +20,8 @@ from karaoke.aligner import (
     lines_to_editor_text,
     regroup_editor_lines,
     split_long_editor_lines,
+    realign_editor_timings,
+    realign_editor_timings_with_lines,
 )
 from karaoke.api.websocket import ws_manager
 from karaoke.cancel_manager import (
@@ -70,6 +72,12 @@ class SplitLinesRequest(BaseModel):
     max_words: int = 8
 
 
+class RealignTimingsRequest(BaseModel):
+    title: Optional[str] = None
+    editor_text: str
+    original_lines: Optional[List[Any]] = None
+
+
 class AutoFxRequest(BaseModel):
     title: str
 
@@ -115,6 +123,13 @@ class SliceAlignRequest(BaseModel):
     end: float
     text: str
     mode: str = "whisper"
+
+
+class NotifyUpdateRequest(BaseModel):
+    type: str = "project_updated"
+    title: Optional[str] = None
+    message: Optional[str] = None
+    action: Optional[str] = None
 
 
 class SlicePreviewRequest(BaseModel):
@@ -516,6 +531,43 @@ def split_lines(payload: SplitLinesRequest) -> Dict[str, Any]:
         "original_count": len(lines),
         "new_count": len(new_lines),
         "split_count": len(new_lines) - len(lines),
+    }
+
+
+@router.post("/tools/realign-timings")
+def realign_timings(payload: RealignTimingsRequest) -> Dict[str, Any]:
+    vocals_path = None
+    recognized_words = None
+    state_file = None
+    state_data = None
+    if payload.title:
+        state_file = WORK_DIR / f"{payload.title}_state.json"
+        if state_file.exists():
+            try:
+                state_data = json.loads(state_file.read_text(encoding="utf-8"))
+                v_cand = Path(state_data.get("vocals_wav", ""))
+                if v_cand.exists():
+                    vocals_path = v_cand
+                recognized_words = state_data.get("recognized_words")
+            except Exception:
+                pass
+
+    new_editor_text, new_lines = realign_editor_timings_with_lines(
+        editor_text=payload.editor_text,
+        original_lines=payload.original_lines or [],
+        recognized_words=recognized_words,
+        vocals_path=vocals_path,
+    )
+    if state_file and state_data is not None:
+        state_data["editor_text"] = new_editor_text
+        state_data["lines"] = new_lines
+        state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        notify_project_updated(payload.title)
+
+    return {
+        "lines": new_lines,
+        "editor_text": new_editor_text,
+        "count": len(new_lines),
     }
 
 
@@ -1147,3 +1199,16 @@ def get_slice_preview_video(title: str):
     if preview_file.exists():
         return FileResponse(preview_file, media_type="video/mp4")
     raise HTTPException(status_code=404, detail="Превью видео не найдено.")
+
+
+@router.post("/system/notify-update")
+def notify_update(payload: NotifyUpdateRequest) -> Dict[str, Any]:
+    ws_manager.broadcast_threadsafe({
+        "type": payload.type,
+        "title": payload.title,
+        "message": payload.message,
+        "action": payload.action,
+        "timestamp": time.time(),
+    })
+    return {"status": "ok"}
+

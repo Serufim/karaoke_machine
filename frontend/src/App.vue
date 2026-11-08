@@ -113,9 +113,16 @@ function onMouseUp() {
   isDraggingRow.value = false
 }
 
+function onWindowFocus() {
+  if (projectStore.currentProject?.title && !projectStore.isDirty && !pipelineStore.isRunning) {
+    projectStore.loadProject(projectStore.currentProject.title)
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('mousemove', onMouseMove)
   window.addEventListener('mouseup', onMouseUp)
+  window.addEventListener('focus', onWindowFocus)
 
   pipelineStore.initWebSocket()
   await projectStore.fetchProjects()
@@ -127,6 +134,7 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener('mousemove', onMouseMove)
   window.removeEventListener('mouseup', onMouseUp)
+  window.removeEventListener('focus', onWindowFocus)
 })
 </script>
 

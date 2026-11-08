@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useProjectStore } from '@/stores/project'
 import { usePlayerStore } from '@/stores/player'
+import { usePipelineStore } from '@/stores/pipeline'
 import type { VocalInterval, FxInterval, EmojiInterval } from '@/types'
 import EffectsMenuModal from './EffectsMenuModal.vue'
 import EmojiBurstModal from './EmojiBurstModal.vue'
@@ -14,10 +15,12 @@ import {
   Palette,
   Wand2,
   Trash2,
+  RefreshCw,
 } from 'lucide-vue-next'
 
 const projectStore = useProjectStore()
 const playerStore = usePlayerStore()
+const pipelineStore = usePipelineStore()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const scrollContainerRef = ref<HTMLDivElement | null>(null)
@@ -932,6 +935,17 @@ onUnmounted(() => {
         >
           <Wand2 class="w-3.5 h-3.5" />
           <span>Мануальный режим</span>
+        </button>
+
+        <!-- Quick Rebuild Button directly above timeline strip -->
+        <button
+          @click="pipelineStore.quickRebuild()"
+          :disabled="!projectStore.hasProject || pipelineStore.isRebuilding"
+          class="flex items-center space-x-1.5 px-3 py-1 rounded-md bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white font-semibold shadow-sm disabled:opacity-40 transition-all border border-sky-400/40"
+          title="Пересобрать видео со всеми новыми таймингами и эффектами"
+        >
+          <RefreshCw :class="['w-3.5 h-3.5', pipelineStore.isRebuilding ? 'animate-spin' : '']" />
+          <span>Пересобрать видео</span>
         </button>
 
         <div class="h-4 w-px bg-studio-border mx-1"></div>

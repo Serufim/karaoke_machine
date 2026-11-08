@@ -78,7 +78,7 @@ export interface ProjectMeta {
 }
 
 export interface PipelineProgress {
-  type: 'progress' | 'completed' | 'cancelled' | 'error' | 'model_progress'
+  type: 'progress' | 'completed' | 'cancelled' | 'error' | 'model_progress' | 'project_updated'
   fraction?: number
   message?: string
   stage?: string

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { useProjectStore } from '@/stores/project'
+import { usePipelineStore } from '@/stores/pipeline'
 import {
   FileText,
   Sparkles,
@@ -11,9 +12,12 @@ import {
   Camera,
   Upload,
   Image as ImageIcon,
+  RefreshCw,
+  Clock,
 } from 'lucide-vue-next'
 
 const projectStore = useProjectStore()
+const pipelineStore = usePipelineStore()
 
 const localText = ref('')
 const isCopied = ref(false)
@@ -136,6 +140,19 @@ async function handleAutoDetectFx() {
     isProcessingTool.value = false
   }
 }
+
+async function handleRealignTimings() {
+  if (isProcessingTool.value) return
+  isProcessingTool.value = true
+  try {
+    const data = await projectStore.realignTimings()
+    if (data) {
+      showToolNotice(`⏱️ Тайминги пересчитаны (${data.count} строк)`)
+    }
+  } finally {
+    isProcessingTool.value = false
+  }
+}
 </script>
 
 <template>
@@ -147,7 +164,17 @@ async function handleAutoDetectFx() {
         <span>Текст и тайминги</span>
       </div>
 
-      <div class="flex items-center space-x-1">
+      <div class="flex items-center space-x-1.5">
+        <button
+          @click="pipelineStore.quickRebuild()"
+          :disabled="!projectStore.hasProject || pipelineStore.isRebuilding"
+          class="flex items-center space-x-1 px-2 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold shadow-sm disabled:opacity-40 transition-colors"
+          title="Быстро пересобрать видео с отредактированным текстом и таймингами"
+        >
+          <RefreshCw :class="['w-3 h-3', pipelineStore.isRebuilding ? 'animate-spin' : '']" />
+          <span>Пересобрать видео</span>
+        </button>
+
         <button
           @click="copyToClipboard"
           title="Скопировать в буфер"
@@ -232,6 +259,27 @@ async function handleAutoDetectFx() {
       <div v-if="toolNotice" class="text-[11px] font-medium text-sky-400 bg-sky-500/10 px-2 py-1 rounded border border-sky-500/20 text-center transition-all">
         {{ toolNotice }}
       </div>
+
+      <!-- Main Quick Rebuild Video Button in tools panel -->
+      <button
+        @click="pipelineStore.quickRebuild()"
+        :disabled="!projectStore.hasProject || pipelineStore.isRebuilding"
+        class="w-full flex items-center justify-center space-x-1.5 py-1.5 px-2 rounded text-xs font-semibold bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white shadow-sm border border-sky-400/30 disabled:opacity-40 transition-all"
+        title="Пересобрать видео со всеми новыми правками текста, таймингов и эффектов"
+      >
+        <RefreshCw :class="['w-3.5 h-3.5', pipelineStore.isRebuilding ? 'animate-spin' : '']" />
+        <span>Пересобрать видео с текстом</span>
+      </button>
+
+      <button
+        @click="handleRealignTimings"
+        :disabled="!projectStore.hasProject || isProcessingTool"
+        class="w-full flex items-center justify-center space-x-1.5 py-1.5 px-2 rounded text-xs font-medium bg-studio-surface hover:bg-slate-700 text-emerald-300 border border-studio-border disabled:opacity-40 transition-colors"
+        title="Акустически пересчитать таймкоды [MM:SS.cc -> MM:SS.cc] для строк по вокалу"
+      >
+        <Clock :class="['w-3.5 h-3.5 text-emerald-400', isProcessingTool ? 'animate-spin' : '']" />
+        <span>Пересчитать тайминги текста</span>
+      </button>
 
       <button
         @click="handleRegroupLines"

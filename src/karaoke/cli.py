@@ -14,6 +14,7 @@ from karaoke.aligner import (
     lines_to_editor_text,
     editor_text_to_lines,
     validate_karaoke_lines,
+    refine_unaligned_vocal_slices,
 )
 from karaoke.mixer import (
     mix_guide_vocals,
@@ -133,9 +134,24 @@ def analyze_and_transcribe(
         vad=vad,
     )
 
+    raw_recognized_words = []
+    for seg in transcription.get("segments", []):
+        for w in seg.get("words", []):
+            raw_recognized_words.append(dict(w))
+
+    if reference_lyrics and reference_lyrics.strip():
+        raw_recognized_words = refine_unaligned_vocal_slices(
+            raw_recognized_words,
+            reference_lyrics=reference_lyrics,
+            vocals_path=vocals_wav,
+            whisper_model=whisper_model,
+            work_dir=work_dir,
+        )
+
     alignment_warnings = []
+    segments_payload = [{"words": raw_recognized_words}] if raw_recognized_words else transcription.get("segments", [])
     lines = split_into_karaoke_lines(
-        transcription.get("segments", []),
+        segments_payload,
         reference_lyrics=reference_lyrics,
         warnings_out=alignment_warnings,
         vocals_path=vocals_wav,
@@ -176,6 +192,7 @@ def analyze_and_transcribe(
         "video_bg": str(video_bg) if video_bg else None,
         "use_video_bg": bool(video_bg) if not custom_bg_path else False,
         "use_cover_bg": False if custom_bg_path else True,
+        "recognized_words": raw_recognized_words,
         "lines": lines,
         "editor_text": editor_text,
         "alignment_warnings": alignment_warnings,

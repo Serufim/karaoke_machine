@@ -1,4 +1,5 @@
 import random
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
@@ -65,14 +66,154 @@ def _karaoke_scale(line_words: List[Dict[str, Any]]) -> int:
     return 100
 
 
+RU_VOWELS = set("аеёиоуыэюяАЕЁИОУЫЭЮЯ")
+RU_SPECIAL_SIGNS = set("ьъЬЪ")
+
+
+def split_word_into_syllables(word: str) -> List[str]:
+    """
+    Splits a Russian or multilingual word into phonetic/musical syllables for karaoke highlighting.
+    Preserves all leading/trailing punctuation, hyphens, and characters exactly (sum of parts == word).
+    """
+    if not word or len(word) <= 2:
+        return [word]
+
+    has_cyrillic = bool(re.search(r"[а-яёА-ЯЁ]", word))
+    if not has_cyrillic:
+        # Latin / English syllabification
+        cleaned = re.sub(r"[^a-zA-Z]", "", word).lower()
+        if not cleaned:
+            return [word]
+        v_groups = list(re.finditer(r"[aeiouy]+", word, re.IGNORECASE))
+        if not v_groups:
+            return [word]
+        # Drop silent 'e' at end when multiple vowel groups (e.g. bounce, house, make)
+        if len(v_groups) > 1 and word.lower().rstrip(".,!?;:\"'").endswith("e"):
+            stem = word.lower().rstrip(".,!?;:\"'")
+            if not (len(stem) >= 3 and stem.endswith("le") and stem[-3] not in "aeiouy"):
+                if v_groups[-1].group().lower() == "e" and v_groups[-1].end() == len(stem):
+                    v_groups = v_groups[:-1]
+        if len(v_groups) <= 1:
+            return [word]
+
+        split_indices = []
+        for k in range(len(v_groups) - 1):
+            end_v1 = v_groups[k].end()
+            start_v2 = v_groups[k + 1].start()
+            between = list(range(end_v1, start_v2))
+            if not between:
+                split_indices.append(start_v2)
+            elif len(between) == 1:
+                split_indices.append(between[0])
+            else:
+                mid = end_v1 + (len(between) // 2)
+                split_indices.append(mid)
+
+        sylls = []
+        prev = 0
+        for idx in split_indices:
+            sylls.append(word[prev:idx])
+            prev = idx
+        sylls.append(word[prev:])
+        return sylls
+
+    # Russian / Cyrillic syllabification
+    vowel_indices = [i for i, ch in enumerate(word) if ch in RU_VOWELS]
+    if len(vowel_indices) <= 1:
+        return [word]
+
+    split_indices = []
+    for k in range(len(vowel_indices) - 1):
+        v1 = vowel_indices[k]
+        v2 = vowel_indices[k + 1]
+        consonants = list(range(v1 + 1, v2))
+        if not consonants:
+            # Adjacent vowels: split between them (по-пол-ня-ет, де-ла-ют)
+            split_indices.append(v2)
+            continue
+
+        sign_idx = next((c for c in consonants if word[c] in RU_SPECIAL_SIGNS), None)
+        if sign_idx is not None:
+            # ь/ъ always ends the preceding syllable (сись-ки, подъ-езд, маль-чик)
+            split_indices.append(sign_idx + 1)
+            continue
+
+        y_idx = next((c for c in consonants if word[c] in "йЙ"), None)
+        if y_idx is not None:
+            # й always ends the preceding syllable (май-ка, ай-фон, пой-мать)
+            split_indices.append(y_idx + 1)
+            continue
+
+        if len(consonants) == 1:
+            # Single consonant: open syllable rule (ма-ма, ба-ланс)
+            split_indices.append(consonants[0])
+        elif len(consonants) == 2:
+            c0, c1 = consonants[0], consonants[1]
+            ch0, ch1 = word[c0].lower(), word[c1].lower()
+            if ch0 == ch1 or ch0 in "рлмн":
+                # Geminates (ван-на) or sonorant + obstruent (пол-ня, пар-та)
+                split_indices.append(c1)
+            else:
+                # Obstruent cluster belongs to opening of next syllable (се-стра, про-сто)
+                split_indices.append(c0)
+        else:
+            c0 = consonants[0]
+            ch0 = word[c0].lower()
+            if ch0 in "рлмн":
+                split_indices.append(consonants[1])
+            else:
+                split_indices.append(c0)
+
+    sylls = []
+    prev = 0
+    for idx in split_indices:
+        sylls.append(word[prev:idx])
+        prev = idx
+    sylls.append(word[prev:])
+    return sylls
+
+
+def allocate_syllable_durations(syllables: List[str], duration_cs: int) -> List[int]:
+    """
+    Distributes word duration (in centiseconds) across syllables proportionally to alphanumeric weight.
+    Guarantees sum(durations) == duration_cs down to 1 centisecond.
+    """
+    n = len(syllables)
+    if n <= 1:
+        return [duration_cs]
+
+    min_cs = max(1, min(4, duration_cs // n))
+    weights = [max(1, len([c for c in s if c.isalnum()])) for s in syllables]
+    total_w = sum(weights)
+    durs = [max(min_cs, int(round(duration_cs * (w / total_w)))) for w in weights]
+    diff = duration_cs - sum(durs)
+
+    if diff != 0:
+        order = sorted(range(n), key=lambda i: durs[i], reverse=(diff > 0))
+        step = 1 if diff > 0 else -1
+        idx = 0
+        while diff != 0:
+            target_i = order[idx % n]
+            if step > 0 or durs[target_i] > min_cs:
+                durs[target_i] += step
+                diff -= step
+            idx += 1
+            if idx > n * 10:
+                durs[order[0]] += diff
+                break
+
+    return durs
+
+
 def build_karaoke_line_tags(
     line_words: List[Dict[str, Any]],
     display_start: float,
     font_size: float = 54,
 ) -> str:
     """
-    Builds the ASS {\k} and {\kf} tagged string for the active karaoke line.
+    Builds the ASS {\\k} and {\\kf} tagged string for the active karaoke line.
     Automatically scales down font width if the line is very long (> 40 chars) so it never wraps.
+    Highlights multi-syllable words syllable-by-syllable (\\kf) for natural musical cadence.
     """
     line_start = line_words[0]["start"]
     lead_in_gap = max(0.0, line_start - display_start)
@@ -101,7 +242,16 @@ def build_karaoke_line_tags(
             k_text += f"{{\\k{gap_cs}}}"
 
         duration_cs = max(8, int(round((w_end - w_start) * 100)))
-        k_text += f"{{\\kf{duration_cs}}}{_ass_text_with_emoji(word_str, font_size)} "
+
+        sylls = split_word_into_syllables(word_str)
+        if len(sylls) <= 1:
+            k_text += f"{{\\kf{duration_cs}}}{_ass_text_with_emoji(word_str, font_size)} "
+        else:
+            syll_durs = allocate_syllable_durations(sylls, duration_cs)
+            for s_dur, s_txt in zip(syll_durs, sylls):
+                k_text += f"{{\\kf{s_dur}}}{_ass_text_with_emoji(s_txt, font_size)}"
+            k_text += " "
+
         prev_word_end = w_end
 
     return k_text.strip()

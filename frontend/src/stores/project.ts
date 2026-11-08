@@ -33,6 +33,7 @@ export const useProjectStore = defineStore('project', () => {
   const isDirty = ref<boolean>(false)
   const errorMessage = ref<string | null>(null)
   const coverTimestamp = ref<number>(Date.now())
+  const mediaTimestamp = ref<number>(Date.now())
 
   // Undo/Redo history of intervals & editor_text & lines
   const history = ref<string[]>([])
@@ -112,6 +113,7 @@ export const useProjectStore = defineStore('project', () => {
       historyIndex.value = -1
       pushHistory()
       isDirty.value = false
+      mediaTimestamp.value = Date.now()
     } catch (e: any) {
       errorMessage.value = e.message
     } finally {
@@ -257,6 +259,30 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  async function realignTimings() {
+    if (!currentProject.value) return null
+    try {
+      const res = await fetch('/api/tools/realign-timings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: currentProject.value.title,
+          editor_text: currentProject.value.editor_text,
+          original_lines: currentProject.value.lines,
+        }),
+      })
+      if (!res.ok) throw new Error('Ошибка перерасчета таймингов')
+      const data = await res.json()
+      currentProject.value.editor_text = data.editor_text
+      currentProject.value.lines = data.lines
+      pushHistory()
+      return data
+    } catch (e: any) {
+      errorMessage.value = e.message
+      throw e
+    }
+  }
+
   async function uploadCover(file: File) {
     if (!currentProject.value) return
     errorMessage.value = null
@@ -318,6 +344,7 @@ export const useProjectStore = defineStore('project', () => {
     isDirty,
     errorMessage,
     coverTimestamp,
+    mediaTimestamp,
     hasProject,
     duration,
     title,
@@ -334,6 +361,7 @@ export const useProjectStore = defineStore('project', () => {
     regroupLines,
     splitLongLines,
     autoDetectFx,
+    realignTimings,
     undo,
     redo,
     canUndo: computed(() => historyIndex.value > 0),

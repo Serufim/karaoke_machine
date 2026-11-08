@@ -55,6 +55,28 @@ def test_split_lines():
     assert len(data["lines"]) == data["new_count"]
 
 
+def test_realign_timings_endpoint():
+    sample_text = (
+        "Первая строка песни\n"
+        "Вторая строка песни"
+    )
+    original_lines = [
+        [{"text": "Первая", "start": 1.0, "end": 1.5}, {"text": "строка", "start": 1.5, "end": 2.0}, {"text": "песни", "start": 2.0, "end": 2.5}],
+        [{"text": "Вторая", "start": 5.0, "end": 5.5}, {"text": "строка", "start": 5.5, "end": 6.0}, {"text": "песни", "start": 6.0, "end": 6.5}],
+    ]
+    response = client.post(
+        "/api/tools/realign-timings",
+        json={"editor_text": sample_text, "original_lines": original_lines},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "editor_text" in data
+    assert "lines" in data
+    assert data["count"] == 2
+    assert "[00:01.00 ->" in data["editor_text"]
+    assert "[00:05.00 ->" in data["editor_text"]
+
+
 def test_get_nonexistent_project():
     response = client.get("/api/projects/non_existent_project_123456")
     assert response.status_code == 404

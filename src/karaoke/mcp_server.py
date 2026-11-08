@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,30 @@ WORK_DIR = (OUTPUT_DIR / "work").resolve()
 
 # Create MCP server instance
 server = MCPServer("karaoke-studio")
+
+
+def notify_studio_ui(event_type: str, title: str, message: str = "", action: str = ""):
+    """Broadcasts event to running studio UI via local HTTP endpoint across possible ports."""
+    payload = json.dumps({
+        "type": event_type,
+        "title": title,
+        "message": message,
+        "action": action,
+    }).encode("utf-8")
+    for port in (7860, 7861, 7862, 7863, 7864, 7865):
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/system/notify-update",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=0.8) as resp:
+                if resp.status == 200:
+                    break
+        except Exception:
+            continue
+
 
 
 @server.tool()
@@ -299,6 +324,8 @@ def update_project_lyrics(title: str, editor_text: str) -> Dict[str, Any]:
         lyrics_txt = OUTPUT_DIR / f"{title}_lyrics.txt"
         lyrics_txt.write_text(clean_editor, encoding="utf-8")
 
+        notify_studio_ui("project_updated", title, "Текст обновлен через MCP", "lyrics_updated")
+
         return {
             "status": "success",
             "title": title,
@@ -353,6 +380,8 @@ def shift_line_timing(title: str, line_index: int, new_start: float, new_end: fl
         state_data["lines"] = lines
         state_data["editor_text"] = clean_editor
         state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        notify_studio_ui("project_updated", title, "Тайминг сдвинут через MCP", "timing_shifted")
 
         return {
             "status": "success",
@@ -416,6 +445,14 @@ def rebuild_video(
             dual_audio_mp4=dual_audio_mp4,
             watermark_text=watermark_text if watermark_text else None,
         )
+
+        state_data["visual_effects"] = visual_effects
+        state_data["highlight_color"] = highlight_color
+        state_data["num_lines"] = num_lines
+        state_data["has_video"] = True
+        state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        notify_studio_ui("completed", title, "Видео успешно пересобрано через MCP!", "rebuild")
 
         return {
             "status": "success",

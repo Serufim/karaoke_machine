@@ -1,3 +1,6 @@
+import os
+import shutil
+import time
 import json
 import inspect
 from pathlib import Path
@@ -10,6 +13,7 @@ from karaoke.aligner import (
     lines_to_editor_text,
     regroup_editor_lines,
     split_long_editor_lines,
+    realign_editor_timings,
 )
 from karaoke.separator import DEMUCS_MODELS
 from karaoke.transcriber import WHISPER_MODELS
@@ -26,7 +30,7 @@ from karaoke.cancel_manager import (
 )
 
 
-STUDIO_JS = """
+STUDIO_JS = r"""
 () => {
     if (window.__karaokeStudioInitialized) return;
     window.__karaokeStudioInitialized = true;
@@ -87,29 +91,88 @@ STUDIO_JS = """
             }
             // Use one playback owner; the Gradio widget is only a file transport.
             if (nativeAudio && !nativeAudio.paused) nativeAudio.pause();
-            if (video && video !== this.boundVideo) {
-                if (this.boundVideo) {
-                    for (const event of ['play', 'pause', 'ended', 'seeking', 'seeked', 'ratechange']) {
-                        this.boundVideo.removeEventListener(event, this.mediaListener);
+            if (video) {
+                const videoSrc = video.currentSrc || video.src || '';
+                if (video !== this.boundVideo || videoSrc !== this.boundVideoSrc) {
+                    if (this.boundVideo) {
+                        for (const event of ['play', 'pause', 'ended', 'seeking', 'seeked', 'ratechange', 'loadedmetadata']) {
+                            this.boundVideo.removeEventListener(event, this.mediaListener);
+                        }
                     }
-                }
-                this.boundVideo = video;
-                this.mediaListener = () => this.tick();
-                for (const event of ['play', 'pause', 'ended', 'seeking', 'seeked', 'ratechange']) {
-                    video.addEventListener(event, this.mediaListener);
+                    this.boundVideo = video;
+                    this.boundVideoSrc = videoSrc;
+                    this.mediaListener = () => this.tick();
+                    for (const event of ['play', 'pause', 'ended', 'seeking', 'seeked', 'ratechange', 'loadedmetadata']) {
+                        video.addEventListener(event, this.mediaListener);
+                    }
+                    try { video.load(); } catch (e) {}
+                    this.updatePlayButtonLabel();
                 }
             }
             return { video, audio };
         },
 
+        parseTimecode(tsStr) {
+            if (!tsStr) return null;
+            const clean = String(tsStr).trim().replace(',', '.');
+            const parts = clean.split(':').filter(p => p.length > 0);
+            if (parts.length === 3) {
+                return (Number(parts[0]) || 0) * 3600 + (Number(parts[1]) || 0) * 60 + (Number(parts[2]) || 0);
+            } else if (parts.length === 2) {
+                return (Number(parts[0]) || 0) * 60 + (Number(parts[1]) || 0);
+            } else if (parts.length === 1) {
+                return Number(parts[0]) || 0;
+            }
+            return null;
+        },
+
         syncMediaToSec(targetSec) {
             const { video, audio } = this.getMedia();
-            const clamped = Math.max(0, Math.min(this.duration || 9999, Number(targetSec) || 0));
+            const dur = Math.max(1, this.duration || (video && video.duration) || 9999);
+            const clamped = Math.max(0, Math.min(dur, Number(targetSec) || 0));
             if (video) {
                 try { video.currentTime = clamped; } catch (e) {}
             }
             if (audio && audio.src) {
                 try { audio.currentTime = clamped; } catch (e) {}
+            }
+        },
+
+        seekRelative(deltaSec) {
+            const { video } = this.getMedia();
+            const cur = (video && !isNaN(video.currentTime)) ? video.currentTime : 0;
+            this.syncMediaToSec(cur + Number(deltaSec || 0));
+            this.renderTimeline();
+        },
+
+        seekToSec(targetSec) {
+            this.syncMediaToSec(targetSec);
+            this.renderTimeline();
+        },
+
+        clearSelection() {
+            this.selStart = null;
+            this.selEnd = null;
+            this.syncInputsToGradio();
+            this.renderTimeline();
+        },
+
+        seekToCurrentEditorLine() {
+            const box = document.querySelector('#karaoke-lyrics-editor textarea');
+            if (!box) return;
+            const pos = box.selectionStart || 0;
+            const text = box.value || '';
+            const beforeCursor = text.substring(0, pos);
+            const lineIndex = beforeCursor.split('\n').length - 1;
+            const lines = text.split('\n');
+            const curLine = lines[lineIndex] || '';
+            const m = curLine.match(/\[\s*([0-9:.,]+)/);
+            if (m) {
+                const sec = this.parseTimecode(m[1]);
+                if (sec !== null) {
+                    this.syncMediaToSec(sec);
+                    this.renderTimeline();
+                }
             }
         },
 
@@ -124,13 +187,6 @@ STUDIO_JS = """
                 if (audio) audio.pause();
                 this.updatePlayButtonLabel();
                 return;
-            }
-            if (this.selStart !== null && this.selEnd !== null) {
-                const s = Math.min(this.selStart, this.selEnd);
-                const e = Math.max(this.selStart, this.selEnd);
-                if (video.currentTime < s || video.currentTime >= e - 0.08) {
-                    this.syncMediaToSec(s);
-                }
             }
             video.play().catch(() => {});
             this.updatePlayButtonLabel();
@@ -160,44 +216,26 @@ STUDIO_JS = """
         },
 
         toggleLeftDrawer(force) {
+            const tabBtn = document.querySelector('#studio-tabs button:first-child');
+            if (tabBtn) tabBtn.click();
             const d = document.getElementById('studio-drawer-left');
-            const b = document.getElementById('studio-drawer-backdrop');
-            if (!d) return;
-            const isOpen = d.classList.contains('open');
-            const toOpen = force !== undefined ? force : !isOpen;
-            if (toOpen) {
-                d.classList.add('open');
-                if (b) b.classList.add('active');
-            } else {
-                d.classList.remove('open');
-                const rightD = document.getElementById('studio-drawer-right');
-                if (b && (!rightD || !rightD.classList.contains('open'))) {
-                    b.classList.remove('active');
-                }
-            }
+            if (d) d.classList.toggle('open', force !== undefined ? force : !d.classList.contains('open'));
         },
 
         toggleRightDrawer(force) {
+            const tabBtns = document.querySelectorAll('#studio-tabs button');
+            if (tabBtns && tabBtns.length >= 2) tabBtns[1].click();
             const d = document.getElementById('studio-drawer-right');
-            const b = document.getElementById('studio-drawer-backdrop');
-            if (!d) return;
-            const isOpen = d.classList.contains('open');
-            const toOpen = force !== undefined ? force : !isOpen;
-            if (toOpen) {
-                d.classList.add('open');
-                if (b) b.classList.add('active');
-            } else {
-                d.classList.remove('open');
-                const leftD = document.getElementById('studio-drawer-left');
-                if (b && (!leftD || !leftD.classList.contains('open'))) {
-                    b.classList.remove('active');
-                }
-            }
+            if (d) d.classList.toggle('open', force !== undefined ? force : !d.classList.contains('open'));
         },
 
         closeDrawers() {
-            this.toggleLeftDrawer(false);
-            this.toggleRightDrawer(false);
+            const b = document.getElementById('studio-drawer-backdrop');
+            if (b) b.classList.remove('active');
+            const dL = document.getElementById('studio-drawer-left');
+            if (dL) dL.classList.remove('open');
+            const dR = document.getElementById('studio-drawer-right');
+            if (dR) dR.classList.remove('open');
         },
 
         setZoom(factor) {
@@ -669,8 +707,9 @@ STUDIO_JS = """
                     }
                 }
 
-                // 2) If clicked on top time ruler (Y <= 22): immediate seek & playhead move
+                // 2) If clicked on top time ruler (Y <= 22): immediate seek & live scrub
                 if (y <= 22) {
+                    this.isScrubbingRuler = true;
                     this.syncMediaToSec(sec);
                     this.renderTimeline();
                     return;
@@ -687,6 +726,12 @@ STUDIO_JS = """
             });
 
             window.addEventListener('mousemove', (e) => {
+                if (this.isScrubbingRuler) {
+                    const sec = getSecFromEvent(e);
+                    this.syncMediaToSec(sec);
+                    this.renderTimeline();
+                    return;
+                }
                 if (!this.isDragging) return;
                 const sec = getSecFromEvent(e);
                 if (this.dragMode === 'left') {
@@ -701,6 +746,10 @@ STUDIO_JS = """
             });
 
             window.addEventListener('mouseup', (e) => {
+                if (this.isScrubbingRuler) {
+                    this.isScrubbingRuler = false;
+                    return;
+                }
                 if (!this.isDragging) return;
                 this.isDragging = false;
                 const s = Math.min(this.selStart, this.selEnd);
@@ -774,11 +823,11 @@ STUDIO_JS = """
                     video.volume = Math.max(0, Math.min(1, this.videoVol));
                 }
 
-                // Loop selection if enabled
+                // Loop selection if enabled and playback naturally reached end of selection
                 if (this.loopSelection && !video.paused && this.selStart !== null && this.selEnd !== null) {
                     const s = Math.min(this.selStart, this.selEnd);
                     const e = Math.max(this.selStart, this.selEnd);
-                    if (e - s >= 0.3 && video.currentTime >= e) {
+                    if (e - s >= 0.3 && video.currentTime >= e && video.currentTime <= e + 0.6) {
                         this.syncMediaToSec(s);
                     }
                 }
@@ -891,125 +940,100 @@ SYNC_TIMELINE_TO_GRADIO_JS = """
 """
 
 STUDIO_CSS = """
-/* 100% Full-Width Layout */
+/* 100% Full-Width Responsive Studio Layout */
 body {
     overflow-x: hidden !important;
+    background-color: #070b14 !important;
 }
 
 .gradio-container {
     max-width: 100% !important;
     width: 100% !important;
     margin: 0 !important;
-    padding: 8px 18px !important;
+    padding: 8px 16px !important;
     overflow-x: hidden !important;
 }
 
-/* Slide-out Drawers with unified single scroll */
-#studio-drawer-left {
-    position: fixed !important;
-    top: 0 !important;
-    left: -580px !important;
-    width: 540px !important;
-    max-width: 90vw !important;
-    height: 100vh !important;
-    display: block !important;
-    background: #0b1120 !important;
-    border-right: 2px solid #38bdf8 !important;
-    box-shadow: 18px 0 50px rgba(0,0,0,0.8) !important;
-    z-index: 1050 !important;
-    transition: left 0.32s cubic-bezier(0.16, 1, 0.3, 1) !important;
-    overflow-y: auto !important;
-    overflow-x: hidden !important;
-    overscroll-behavior: contain !important;
-    padding: 16px 18px 64px 16px !important;
-}
-#studio-drawer-left.open {
-    left: 0 !important;
-}
-
-#studio-drawer-right {
-    position: fixed !important;
-    top: 0 !important;
-    right: -600px !important;
-    width: 560px !important;
-    max-width: 90vw !important;
-    height: 100vh !important;
-    display: block !important;
-    background: #0b1120 !important;
-    border-left: 2px solid #a855f7 !important;
-    box-shadow: -18px 0 50px rgba(0,0,0,0.8) !important;
-    z-index: 1050 !important;
-    transition: right 0.32s cubic-bezier(0.16, 1, 0.3, 1) !important;
-    overflow-y: auto !important;
-    overflow-x: hidden !important;
-    overscroll-behavior: contain !important;
-    padding: 16px 18px 64px 16px !important;
-}
-#studio-drawer-right.open {
-    right: 0 !important;
-}
-
-/* Prevent inner sections inside drawers from creating nested scrollbars */
-#studio-drawer-right > *,
-#studio-drawer-left > * {
-    margin-bottom: 12px !important;
-    flex-shrink: 0 !important;
-    max-height: none !important;
-    height: auto !important;
-    overflow: visible !important;
-}
-
-#studio-drawer-right .styler,
-#studio-drawer-right .form,
-#studio-drawer-right .block,
-#studio-drawer-right .gr-group,
-#studio-drawer-right .gr-box,
-#studio-drawer-right .accordion,
-#studio-drawer-right .wrap,
-#studio-drawer-left .styler,
-#studio-drawer-left .form,
-#studio-drawer-left .block,
-#studio-drawer-left .gr-group {
-    overflow: visible !important;
-    overflow-y: visible !important;
-    overflow-x: visible !important;
-    max-height: none !important;
-    height: auto !important;
-    flex-shrink: 0 !important;
-}
-
-/* Backdrop for smooth closing on click */
-#studio-drawer-backdrop {
-    position: fixed !important;
-    top: 0 !important;
-    left: 0 !important;
-    width: 100vw !important;
-    height: 100vh !important;
-    background: rgba(15, 23, 42, 0.65) !important;
-    backdrop-filter: blur(4px) !important;
-    -webkit-backdrop-filter: blur(4px) !important;
-    z-index: 1040 !important;
-    display: none !important;
-    opacity: 0 !important;
-    transition: opacity 0.25s ease !important;
-}
-#studio-drawer-backdrop.active {
-    display: block !important;
-    opacity: 1 !important;
-}
-
-/* Main stage full width */
-#karaoke-main-stage {
+/* Studio 2-Column Split Workspace */
+#studio-workspace-split {
+    display: flex !important;
+    gap: 16px !important;
+    align-items: flex-start !important;
     width: 100% !important;
-    max-width: 100% !important;
+}
+
+#stage-left-column {
+    min-width: 0 !important;
+    flex: 7 1 0% !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+}
+
+#tools-right-column {
+    min-width: 0 !important;
+    flex: 5 1 0% !important;
+    background: #0d1527 !important;
+    border: 1px solid #1e293b !important;
+    border-radius: 12px !important;
+    padding: 10px 14px 18px 14px !important;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4) !important;
+}
+
+@media (max-width: 992px) {
+    #studio-workspace-split {
+        flex-direction: column !important;
+    }
+    #stage-left-column, #tools-right-column {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+}
+
+/* Video Player - Compact 16:9 view that never pushes timeline down */
+#karaoke-main-video {
+    background: #000 !important;
+    border-radius: 10px !important;
+    overflow: hidden !important;
+    border: 1px solid #1e293b !important;
 }
 
 #karaoke-main-video video {
-    max-height: 56vh !important;
-    width: auto !important;
-    margin: 0 auto !important;
+    max-height: 42vh !important;
+    width: 100% !important;
+    object-fit: contain !important;
+    background: #000 !important;
+}
+
+/* Lyrics Editor inside Right Tab */
+#karaoke-lyrics-editor textarea {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+    font-size: 13px !important;
+    line-height: 1.55 !important;
+    background: #060911 !important;
+    color: #e2e8f0 !important;
+    border: 1px solid #334155 !important;
     border-radius: 8px !important;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5) !important;
+}
+
+/* Hidden bridge elements */
+#studio-hidden-sync-bridge {
+    position: absolute !important;
+    left: -9999px !important;
+    top: -9999px !important;
+    width: 1px !important;
+    height: 1px !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+
+#studio-drawer-backdrop {
+    display: none !important;
+}
+
+#studio-drawer-left, #studio-drawer-right {
+    display: none !important;
 }
 
 /* Top bar controls */
@@ -1252,6 +1276,101 @@ def split_project_lines_ui(
     )
 
 
+def realign_project_timings_ui(
+    state_data: Optional[Dict[str, Any]],
+    editor_text: str,
+    vocal_intervals_json: str = "",
+    fx_intervals_json: str = "",
+):
+    """Recomputes and aligns line timings from edited lyrics and acoustic speech data."""
+    if not state_data or "title" not in state_data:
+        raise gr.Error("Сначала распознайте трек или загрузите проект из кэша!")
+    if not editor_text or not editor_text.strip():
+        raise gr.Error("Поле редактора текста пустое!")
+
+    original_lines = state_data.get("lines", [])
+    recognized_words = state_data.get("recognized_words", [])
+    vocals_wav = Path(state_data["vocals_wav"]) if state_data.get("vocals_wav") else None
+
+    old_count = len(original_lines)
+    new_editor_text = realign_editor_timings(
+        editor_text=editor_text,
+        original_lines=original_lines,
+        recognized_words=recognized_words,
+        vocals_path=vocals_wav,
+    )
+    new_lines = editor_text_to_lines(new_editor_text, original_lines=original_lines, vocals_path=vocals_wav)
+
+    state_data["lines"] = new_lines
+    state_data["editor_text"] = new_editor_text
+    state_data["vocal_intervals"] = _parse_intervals_json(vocal_intervals_json, state_data.get("vocal_intervals", []))
+    state_data["fx_intervals"] = _parse_intervals_json(fx_intervals_json, state_data.get("fx_intervals", []))
+
+    title = state_data["title"]
+    state_file = Path("./output/work").resolve() / f"{title}_state.json"
+    if state_file.parent.exists():
+        state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lyrics_file = Path("./output").resolve() / f"{title}_lyrics.txt"
+    if lyrics_file.parent.exists():
+        lyrics_file.write_text(new_editor_text, encoding="utf-8")
+
+    return (
+        state_data,
+        new_editor_text,
+        _build_timeline_payload(state_data),
+        f"⏱️ Тайминги строк успешно пересчитаны по вокалу ({len(new_lines)} строк, было {old_count}). Нажмите «Пересобрать видео в 1080p»!",
+    )
+
+
+def apply_raw_lyrics_ui(
+    state_data: Optional[Dict[str, Any]],
+    raw_lyrics_text: str,
+    vocal_intervals_json: str = "",
+    fx_intervals_json: str = "",
+):
+    """Replaces current lyrics with whole raw lyrics and aligns them instantly to vocals."""
+    if not state_data or "title" not in state_data:
+        raise gr.Error("Сначала загрузите проект или создайте трек!")
+    if not raw_lyrics_text or not raw_lyrics_text.strip():
+        raise gr.Error("Введите текст песни!")
+
+    original_lines = state_data.get("lines", [])
+    recognized_words = state_data.get("recognized_words", [])
+    vocals_wav = Path(state_data["vocals_wav"]) if state_data.get("vocals_wav") else None
+
+    old_count = len(original_lines)
+    new_editor_text = realign_editor_timings(
+        editor_text=raw_lyrics_text,
+        original_lines=original_lines,
+        recognized_words=recognized_words,
+        vocals_path=vocals_wav,
+    )
+    new_lines = editor_text_to_lines(new_editor_text, original_lines=original_lines, vocals_path=vocals_wav)
+
+    state_data["lines"] = new_lines
+    state_data["editor_text"] = new_editor_text
+    state_data["reference_lyrics"] = raw_lyrics_text
+    state_data["vocal_intervals"] = _parse_intervals_json(vocal_intervals_json, state_data.get("vocal_intervals", []))
+    state_data["fx_intervals"] = _parse_intervals_json(fx_intervals_json, state_data.get("fx_intervals", []))
+
+    title = state_data["title"]
+    state_file = Path("./output/work").resolve() / f"{title}_state.json"
+    if state_file.parent.exists():
+        state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lyrics_file = Path("./output").resolve() / f"{title}_lyrics.txt"
+    if lyrics_file.parent.exists():
+        lyrics_file.write_text(new_editor_text, encoding="utf-8")
+
+    return (
+        state_data,
+        new_editor_text,
+        _build_timeline_payload(state_data),
+        f"⚡ Готовый текст успешно выровнен по вокалу ({len(new_lines)} строк, было {old_count}). Нажмите «Пересобрать видео в 1080p»!",
+    )
+
+
 def auto_detect_fx_ui(state_data: Optional[Dict[str, Any]]):
     """Detects energetic choruses and emotional climaxes and places FX on the timeline."""
     if not state_data or "title" not in state_data:
@@ -1369,11 +1488,29 @@ def run_full_karaoke_ui(
         fx_itv_json = json.dumps(state_data.get("fx_intervals", []))
         timeline_payload_json = _build_timeline_payload(state_data)
 
+        # Cache-busting revision file so Gradio / browser loads fresh MP4 cleanly
+        ts = int(time.time())
+        versioned_video = output_dir / f"{state_data['title']}_karaoke_v{ts}.mp4"
+        try:
+            for old_rev in output_dir.glob(f"{state_data['title']}_karaoke_v*.mp4"):
+                if old_rev != versioned_video:
+                    old_rev.unlink(missing_ok=True)
+            if hasattr(os, "link"):
+                try:
+                    os.link(final_video, versioned_video)
+                except OSError:
+                    shutil.copy2(final_video, versioned_video)
+            else:
+                shutil.copy2(final_video, versioned_video)
+            effective_video_path = versioned_video
+        except Exception:
+            effective_video_path = final_video
+
         return (
             state_data,
             updated_editor_text,
             vocals_val,
-            str(final_video),
+            str(effective_video_path),
             cover_val,
             vocal_itv_json,
             fx_itv_json,
@@ -1463,11 +1600,30 @@ def rebuild_video_from_editor_ui(
         vocal_itv_out = json.dumps(vocal_intervals, ensure_ascii=False)
         fx_itv_out = json.dumps(fx_intervals, ensure_ascii=False)
         timeline_payload_json = _build_timeline_payload(state_data)
+
+        # Cache-busting revision file so Gradio / browser loads fresh MP4 cleanly
+        ts = int(time.time())
+        versioned_video = output_dir / f"{title}_karaoke_v{ts}.mp4"
+        try:
+            for old_rev in output_dir.glob(f"{title}_karaoke_v*.mp4"):
+                if old_rev != versioned_video:
+                    old_rev.unlink(missing_ok=True)
+            if hasattr(os, "link"):
+                try:
+                    os.link(final_video, versioned_video)
+                except OSError:
+                    shutil.copy2(final_video, versioned_video)
+            else:
+                shutil.copy2(final_video, versioned_video)
+            effective_video_path = versioned_video
+        except Exception:
+            effective_video_path = final_video
+
         return (
             state_data,
             updated_editor_text,
             vocals_val,
-            str(final_video),
+            str(effective_video_path),
             cover_val,
             vocal_itv_out,
             fx_itv_out,
@@ -1537,438 +1693,418 @@ def preview_background_image(file_path: Optional[str]):
 
 
 def build_ui():
-    block_options = {"title": "AI Karaoke Studio v0.3.9 (Timing Boundaries)"}
+    block_options = {"title": "AI Karaoke Studio v0.3.9"}
     if "css" in inspect.signature(gr.Blocks.__init__).parameters:
         block_options["css"] = STUDIO_CSS
     with gr.Blocks(**block_options) as demo:
         state_store = gr.State(value=None)
 
-        # 1. Semi-transparent backdrop to close drawers on click or Esc
-        gr.HTML('<div id="studio-drawer-backdrop" onclick="window.__karaokeStudio.closeDrawers()"></div>')
-
-        # 2. Top Navigation Bar (Quick drawer toggles & live status badges)
+        # Top Navigation Bar
         gr.HTML(
             """
             <div id="studio-top-bar" style="display:flex; justify-content:space-between; align-items:center; background:#0f172a; padding:10px 18px; border-radius:10px; border:1px solid #1e293b; margin-bottom:12px; box-shadow:0 4px 12px rgba(0,0,0,0.4);">
                 <div style="display:flex; align-items:center; gap:12px;">
-                    <button type="button" class="studio-nav-btn" onclick="window.__karaokeStudio.toggleLeftDrawer()" style="background:#0284c7; color:#fff; border:none; padding:8px 16px; border-radius:8px; font-weight:bold; font-size:13px; cursor:pointer;">
-                        📝 Текст и тайминги
-                    </button>
                     <span style="font-weight:bold; font-size:16px; color:#f8fafc;">🎤 AI Karaoke Studio v0.3.9</span>
-                    <span style="font-size:12px; color:#38bdf8; background:#1e293b; padding:3px 8px; border-radius:6px; border:1px solid #334155;">Full HD 1080p · 16:9</span>
+                    <span style="font-size:12px; color:#38bdf8; background:#1e293b; padding:3px 8px; border-radius:6px; border:1px solid #334155;">Full HD 1080p · Студийный сплит</span>
                 </div>
                 <div style="display:flex; align-items:center; gap:14px;">
                     <div style="font-family:monospace; font-size:14px; color:#cbd5e1;">⏱️ <strong id="karaoke-live-timecode-val" style="color:#38bdf8; font-size:16px;">[00:00.00]</strong></div>
                     <div id="karaoke-live-sync-badge" style="font-size:13px; color:#9ca3af; font-family:monospace;">🎤 Живой подмес выключен</div>
-                    <button type="button" class="studio-nav-btn" onclick="window.__karaokeStudio.toggleRightDrawer()" style="background:#9333ea; color:#fff; border:none; padding:8px 16px; border-radius:8px; font-weight:bold; font-size:13px; cursor:pointer;">
-                        📂 Источники
-                    </button>
                 </div>
             </div>
             """
         )
 
-        # 3. Left Slide-out Drawer: Lyrics & Timecode Editor
-        with gr.Column(elem_id="studio-drawer-left"):
-            gr.HTML(
-                """
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #1e293b;">
-                    <h3 style="margin:0; color:#38bdf8; font-size:16px;">📝 Редактор текста и таймингов</h3>
-                    <button type="button" onclick="window.__karaokeStudio.toggleLeftDrawer(false)" style="background:#1e293b; color:#94a3b8; border:1px solid #475569; padding:4px 10px; border-radius:6px; cursor:pointer; font-weight:bold;">✕ Закрыть (Esc)</button>
-                </div>
-                <div style="font-size:12px; color:#94a3b8; margin-bottom:8px;">
-                    💡 Вставляйте любые нативные эмодзи Apple (<code>🔥</code>, <code>🎤</code>, <code>👑</code>, <code>✨</code>, <code>💔</code>) прямо в текст или правьте таймкоды!
-                </div>
-                """
-            )
-            with gr.Row():
-                regroup_btn = gr.Button("✨ Авто-склейка коротких строк", variant="secondary", size="sm")
-                split_btn = gr.Button("✂️ Разделить длинные строки", variant="secondary", size="sm")
-            editor_box = gr.Textbox(
-                label="Построчный текст караоке с таймкодами",
-                lines=24,
-                interactive=True,
-            )
-            with gr.Row():
-                rebuild_btn = gr.Button(
-                    "🔄 Пересобрать видео в 1080p",
-                    variant="primary",
-                    size="lg",
-                    scale=3,
-                )
-                cancel_left_btn = gr.Button(
-                    "🛑 Стоп",
-                    variant="stop",
-                    size="lg",
-                    scale=1,
+        with gr.Row(elem_id="studio-workspace-split"):
+            # ЛЕВАЯ КОЛОНКА (scale=7): Видеоплеер, Микшер и 3-дорожечный Таймлайн (всегда на одном экране)
+            with gr.Column(scale=7, elem_id="stage-left-column"):
+                status_box = gr.Textbox(label="Статус выполнения", interactive=False)
+                video_out = gr.Video(
+                    label="🎬 Видеоплеер (Full HD 1920x1080)",
+                    elem_id="karaoke-main-video",
+                    interactive=False,
                 )
 
-        # 4. Right Slide-out Drawer: Project Settings, Neon, Quality, Models & Sources
-        with gr.Column(elem_id="studio-drawer-right"):
-            gr.HTML(
-                """
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #1e293b;">
-                    <h3 style="margin:0; color:#c084fc; font-size:16px;">📂 Источники и распознавание</h3>
-                    <button type="button" onclick="window.__karaokeStudio.toggleRightDrawer(false)" style="background:#1e293b; color:#94a3b8; border:1px solid #475569; padding:4px 10px; border-radius:6px; cursor:pointer; font-weight:bold;">✕ Закрыть (Esc)</button>
-                </div>
-                """
-            )
-
-            with gr.Group():
-                gr.Markdown("### Источник трека")
-                url_box = gr.Textbox(
-                    label="🔗 Ссылка на YouTube / видео",
-                    placeholder="https://www.youtube.com/watch?v=...",
-                )
-                use_video_bg_cb = gr.Checkbox(
-                    label="🎬 Использовать оригинальное видео с YouTube как фон",
-                    value=False,
-                    info="Скачивает клип с YouTube в 1080p и накладывает караоке-текст и эффекты прямо поверх видео",
-                )
-                with gr.Accordion("🍪 Настройки YouTube (авторизация / cookies для обхода бот-защиты)", open=False):
-                    gr.Markdown(
-                        "Если YouTube пишет *«Sign in to confirm you’re not a bot»*, выберите браузер, "
-                        "в котором выполнен вход в YouTube, или загрузите файл cookies.txt."
-                    )
-                    cookie_browser_radio = gr.Radio(
-                        label="🌐 Браузер для импорта cookies",
-                        choices=[
-                            ("Google Chrome (по умолчанию)", "chrome"),
-                            ("Chromium", "chromium"),
-                            ("Firefox", "firefox"),
-                            ("Safari", "safari"),
-                            ("Edge", "edge"),
-                            ("Brave", "brave"),
-                            ("Vivaldi", "vivaldi"),
-                            ("Opera", "opera"),
-                            ("Свой файл cookies.txt", "file"),
-                            ("Без cookies (анонимно)", "none"),
-                        ],
-                        value="chrome",
-                    )
-                    cookie_file_input = gr.File(
-                        label="📄 Файл cookies.txt (Netscape формат)",
-                        file_types=[".txt"],
-                        visible=False,
-                    )
-                file_box = gr.File(
-                    label="🎵 Трек: аудио или видео",
-                    file_types=["audio", "video"],
-                    type="filepath",
-                    elem_id="track-upload",
-                )
-                gr.Markdown("Перетащите один аудио- или видеофайл. Загруженный файл используется вместо ссылки. "
-                            "Видео автоматически становится фоном; оформление настраивается под плеером.")
-
-            with gr.Accordion("⚙️ Модели нейросетей & Свой текст", open=False):
-                model_dropdown = gr.Dropdown(
-                    label="Распознавание речи (Whisper)",
-                    choices=[
-                        ("large-v3-turbo (Рекомендуется: быстрая, идеальна для песен, оперы, высоких нот)", "large-v3-turbo"),
-                        ("bond005/whisper-podlodka-turbo (Русский fine-tune Whisper Turbo)", "bond005/whisper-podlodka-turbo"),
-                        ("antony66/whisper-large-v3-russian (Русский fine-tune для обычной речи)", "antony66/whisper-large-v3-russian"),
-                        ("large-v3 (Базовая большая модель OpenAI)", "large-v3"),
-                        ("medium (Средняя модель)", "medium"),
-                        ("small (Быстрая легкая модель)", "small"),
-                    ],
-                    value="large-v3-turbo",
-                )
-                demucs_dropdown = gr.Dropdown(
-                    label="Отделение вокала (Demucs)",
-                    choices=[
-                        ("htdemucs (Быстрая Hybrid Transformer — 30 сек)", "htdemucs"),
-                        ("htdemucs_ft (4x HQ Studio Fine-Tuned Ensemble — лучшее разделение)", "htdemucs_ft"),
-                        ("hdemucs_mmi (Hybrid Demucs MMI)", "hdemucs_mmi"),
-                        ("mdx_extra (MDX-Net Extra)", "mdx_extra"),
-                    ],
-                    value="htdemucs",
-                )
-                lang_box = gr.Textbox(label="Код языка", value="ru")
-                ctc_checkbox = gr.Checkbox(
-                    label="Кириллическое CTC выравнивание (Wav2Vec2)",
-                    value=False,
-                )
-                ref_lyrics_box = gr.Textbox(
-                    label="Вставьте текст песни (опционально)",
-                    placeholder="Если вставить текст песни до запуска, нейросеть разобьет куплеты строго по строкам...",
-                    lines=8,
-                    max_lines=30,
-                )
-
-            with gr.Row():
-                run_btn = gr.Button("🚀 Создать караоке", variant="primary", size="lg", scale=3)
-                cancel_right_btn = gr.Button("🛑 Отменить", variant="stop", size="lg", scale=1, elem_id="cancel-main-btn")
-
-            with gr.Accordion("📂 Открыть сохраненный проект из кэша", open=True):
-                with gr.Row():
-                    saved_dropdown = gr.Dropdown(
-                        label="Проекты в output/work",
-                        choices=list_saved_states(),
-                        value=list_saved_states()[0] if list_saved_states() else None,
-                        interactive=True,
-                    )
-                    load_btn = gr.Button("📂 Загрузить", variant="secondary")
-
-        # 5. Main Center Stage: 100% Full-Width Video & 3-Track Timeline
-        with gr.Column(elem_id="karaoke-main-stage"):
-            status_box = gr.Textbox(label="Статус выполнения", interactive=False)
-            video_out = gr.Video(
-                label="🎬 Готовое караоке-видео (Full HD 1920x1080)",
-                elem_id="karaoke-main-video",
-                interactive=False,
-            )
-
-            # Пульт Live-отладки вокала (синхронно с видео)
-            with gr.Group():
-                with gr.Row():
-                    live_vocal_slider = gr.Slider(
-                        minimum=0,
-                        maximum=100,
-                        value=0,
-                        step=1,
-                        label="🎤 Live-подмес чистого вокала поверх видео (%)",
-                        info="Крути во время просмотра для проверки синхрона слов",
-                        elem_id="live-vocal-slider",
-                    )
-                    live_video_vol_slider = gr.Slider(
-                        minimum=0,
-                        maximum=100,
-                        value=100,
-                        step=1,
-                        label="🎵 Громкость видео (%)",
-                        info="Приглушай видео, чтобы слышать только чистый голос",
-                        elem_id="live-video-vol-slider",
-                    )
-
-            with gr.Accordion("🎨 Оформление, фон и звук", open=True, elem_id="render-settings"):
-                gr.Markdown("Для первой сборки задайте оформление здесь, затем запустите создание в разделе «Источники». "
-                            "После изменений готового проекта нажмите «Пересобрать видео».")
-                with gr.Tab("Эффекты и текст"):
-                    with gr.Group():
-                        gr.Markdown("### Оформление и эффекты")
-                        edge_color_radio = gr.Radio(
-                            label="🌈 Стиль и цвета неоновой рамки",
-                            choices=[
-                                ("⚡ Киберпанк (Неон-циан + Маджента + Фиолет)", "cyberpunk"),
-                                ("🌸 Розовый (Hot Pink / Synthwave)", "pink"),
-                                ("❄️ Голубой (Electric Ice Blue)", "blue"),
-                                ("🔮 Фиолетовый (Deep Violet / Neon Purple)", "purple"),
-                                ("🔥 Огонь (Fire Orange & Gold)", "fire"),
-                                ("🎨 Цвета обложки (Ambilight)", "cover_colors"),
-                                ("🌈 Радуга (Иридесцентные переливы)", "neon_rainbow"),
-                                ("🚨 Полицейская мигалка (Красный + Синий стробоскоп)", "police"),
-                            ],
-                            value="cyberpunk",
-                        )
-                        font_size_radio = gr.Radio(
-                            label="🔤 Размер шрифта текста",
-                            choices=[
-                                ("Стандартный (54px)", "standard"),
-                                ("Крупный (64px, контрастный — по умолчанию)", "large"),
-                                ("Огромный (74px)", "huge"),
-                            ],
-                            value="large",
-                        )
-                        highlight_color_radio = gr.Radio(
-                            label="🌟 Цвет караоке-выделения (Свип)",
-                            choices=[
-                                ("Золотой неон (#FFDF00)", "gold_neon"),
-                                ("Электрик циан (#00F0FF)", "electric_cyan"),
-                                ("Неон маджента (#FF1493)", "neon_magenta"),
-                                ("Кислотный лайм (#39FF14)", "acid_lime"),
-                                ("Огненный оранж (#FF6A00)", "fire_orange"),
-                            ],
-                            value="gold_neon",
-                        )
-                        fx_dropdown = gr.Dropdown(
-                            label="✨ Режим спецэффектов",
-                            choices=[
-                                ("✨ Блестки + Неон-пульсация рамки (Рекомендуется)", "sparkles_pulse"),
-                                ("🔥 Салют эмодзи (летящие частицы на припевах)", "emoji_burst"),
-                                ("🔮 Эмодзи + Неон-пульсация рамки", "emoji_pulse"),
-                                ("💓 Только пульсация всего периметра 1920x1080", "pulse"),
-                                ("🌟 Только летящие блестки и боке", "sparkles"),
-                                ("🚨 Полицейская мигалка (красно-синий стробоскоп)", "police_strobe"),
-                                ("💥 Эпичный припев (мощный неон + двойные блестки)", "climax"),
-                                ("🎯 Только зоны с дорожки FX (по таймлайну)", "timeline_only"),
-                                ("Без эффектов", "none"),
-                            ],
-                            value="sparkles_pulse",
-                        )
-
-                        lines_radio = gr.Radio(
-                            choices=[3, 4],
-                            value=4,
-                            label="📺 Строк телесуфлера",
-                            info="Активная строка всегда по центру",
-                        )
-
-                with gr.Tab("Фон"):
-                    with gr.Group():
-                        bg_box = gr.File(
-                            label="🖼️ Фоновая картинка или видео",
-                            file_types=["image", "video"],
-                            type="filepath",
-                            elem_id="background-upload",
-                        )
-                        background_preview = gr.Image(
-                            label="Предпросмотр фоновой картинки",
-                            interactive=False,
-                            visible=False,
-                            height=220,
-                            elem_id="background-preview",
-                        )
-                        gr.Markdown("Свой фон заменяет исходное видео и обложку. Картинка масштабируется с обрезкой до 16:9.")
-                        use_cover_cb = gr.Checkbox(
-                            label="🖼️ Обложка трека как фон (Apple Music 1080p Blur)",
-                            value=True,
-                            info="Четкий Full HD задник с карточкой трека и эффектами",
-                        )
-                        cover_preview = gr.Image(
-                            label="Найденная обложка трека",
-                            interactive=False,
-                            height=100,
-                        )
-
-                with gr.Tab("Звук и экспорт"):
-                    with gr.Group():
-                        vocal_vol_slider = gr.Slider(
+                # Пульт Live-отладки вокала (синхронно с видео)
+                with gr.Group():
+                    with gr.Row():
+                        live_vocal_slider = gr.Slider(
                             minimum=0,
                             maximum=100,
                             value=0,
                             step=1,
-                            label="🎙️ Базовый вокал в минусовке (Guide %)",
-                            info="По умолчанию 0% — чистая минусовка. Отдельные участки можно настроить на таймлайне.",
+                            label="🎤 Live-подмес чистого вокала поверх видео (%)",
+                            info="Крути во время просмотра для проверки синхрона слов",
+                            elem_id="live-vocal-slider",
                         )
-                    with gr.Group():
-                        gr.Markdown("### Качество экспорта")
-                        video_quality_radio = gr.Radio(
-                            label="Битрейт и скорость рендера (1080p)",
-                            choices=[
-                                ("Web Light (~2.2 Mbps, небольшой размер файла)", "light"),
-                                ("Balanced 1080p (~4.2 Mbps, рекомендовано)", "balanced"),
-                                ("Studio HQ (~8.5 Mbps, архивное качество)", "hq"),
-                            ],
-                            value="balanced",
-                        )
-                    with gr.Group():
-                        gr.Markdown("### 🎧 Проф. экспорт для DJ, ведущих и караоке-клубов (EnCore! / KaraFun / VirtualDJ)")
-                        dual_audio_cb = gr.Checkbox(
-                            label="🎚️ Dual-Audio MP4 (зашивать 2-ю аудиодорожку со 100% вокалом для переключения Минус/Плюс на лету)",
-                            value=True,
-                            info="В плеере EnCore!, VirtualDJ или VLC диджей может в 1 клик включить голос певца без остановки видео",
-                        )
-                        watermark_box = gr.Textbox(
-                            label="🏷️ Брендинг / Водяной знак DJ или Клуба (в правом верхнем углу экрана)",
-                            placeholder="Например: Karaoke by DJ Alex · Заказ песен: @djalex",
-                            value="",
-                        )
-                        export_dj_btn = gr.Button(
-                            "📦 Собрать универсальный DJ-пак (.KFN + .CDG + .LRC + UltraStar + MP3 стемы)",
-                            variant="secondary",
-                        )
-                        dj_pack_files = gr.File(
-                            label="📥 Готовые файлы DJ-пака (.zip и .kfn)",
-                            file_count="multiple",
-                            interactive=False,
-                            visible=False,
+                        live_video_vol_slider = gr.Slider(
+                            minimum=0,
+                            maximum=100,
+                            value=100,
+                            step=1,
+                            label="🎵 Громкость видео (%)",
+                            info="Приглушай видео, чтобы слышать только чистый голос",
+                            elem_id="live-video-vol-slider",
                         )
 
-
-            # 3-дорожечный интерактивный Таймлайн с синхронным Play и панелью эмодзи
-            with gr.Group():
-                gr.Markdown("### 🎚️ Студийный 3-дорожечный Таймлайн (Минус, Вокал, Спецэффекты)")
-                gr.HTML(
-                    """
-                    <div style="background:#0f172a; padding:12px; border-radius:10px; border:1px solid #334155;">
-                        <!-- Панель транспорта и зума -->
-                        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; margin-bottom:8px; padding-bottom:8px; border-bottom:1px solid #1e293b;">
-                            <div style="display:flex; gap:6px; align-items:center;">
-                                <button type="button" id="btn-tl-play" onclick="window.__karaokeStudio.playFromSelectionOrCursor()" style="background:#16a34a; color:#fff; border:none; padding:5px 14px; border-radius:6px; font-size:12px; font-weight:bold; cursor:pointer;">▶️ Пуск с момента</button>
-                                <button type="button" onclick="window.__karaokeStudio.playFromSelectionStart()" style="background:#0369a1; color:#fff; border:none; padding:5px 10px; border-radius:6px; font-size:12px; cursor:pointer;" title="Перемотать в начало выделенного участка и включить Play">⏮️ Старт выделения</button>
-                                <button type="button" id="btn-tl-loop" onclick="window.__karaokeStudio.toggleLoop()" style="background:#1e293b; color:#e2e8f0; border:1px solid #475569; padding:4px 10px; border-radius:6px; font-size:12px; cursor:pointer;">🔁 Петля: ВЫКЛ</button>
+                # 3-дорожечный интерактивный Таймлайн
+                with gr.Group():
+                    gr.Markdown("### 🎚️ Студийный 3-дорожечный Таймлайн (Минус, Вокал, Спецэффекты)")
+                    gr.HTML(
+                        """
+                        <div style="background:#0f172a; padding:12px; border-radius:10px; border:1px solid #334155;">
+                            <!-- Панель транспорта и зума -->
+                            <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; margin-bottom:8px; padding-bottom:8px; border-bottom:1px solid #1e293b;">
+                                <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
+                                    <button type="button" id="btn-tl-play" onclick="window.__karaokeStudio.playFromSelectionOrCursor()" style="background:#16a34a; color:#fff; border:none; padding:5px 14px; border-radius:6px; font-size:12px; font-weight:bold; cursor:pointer;">▶️ Пуск / Пауза</button>
+                                    <button type="button" onclick="window.__karaokeStudio.seekRelative(-5)" style="background:#1e293b; color:#e2e8f0; border:1px solid #475569; padding:5px 9px; border-radius:6px; font-size:12px; cursor:pointer;" title="Перемотать на 5 секунд назад">⏪ -5 сек</button>
+                                    <button type="button" onclick="window.__karaokeStudio.seekRelative(5)" style="background:#1e293b; color:#e2e8f0; border:1px solid #475569; padding:5px 9px; border-radius:6px; font-size:12px; cursor:pointer;" title="Перемотать на 5 секунд вперед">⏩ +5 сек</button>
+                                    <button type="button" onclick="window.__karaokeStudio.seekToSec(0)" style="background:#1e293b; color:#e2e8f0; border:1px solid #475569; padding:5px 9px; border-radius:6px; font-size:12px; cursor:pointer;" title="Перемотать в начало (0:00)">⏮️ 0:00</button>
+                                    <button type="button" onclick="window.__karaokeStudio.playFromSelectionStart()" style="background:#0369a1; color:#fff; border:none; padding:5px 10px; border-radius:6px; font-size:12px; cursor:pointer;" title="Перемотать в начало выделенного участка и включить Play">🎯 К выделению</button>
+                                    <button type="button" id="btn-tl-loop" onclick="window.__karaokeStudio.toggleLoop()" style="background:#1e293b; color:#e2e8f0; border:1px solid #475569; padding:4px 10px; border-radius:6px; font-size:12px; cursor:pointer;">🔁 Петля: ВЫКЛ</button>
+                                    <button type="button" id="btn-tl-clear-sel" onclick="window.__karaokeStudio.clearSelection()" style="background:#1e293b; color:#94a3b8; border:1px solid #334155; padding:4px 8px; border-radius:6px; font-size:12px; cursor:pointer;" title="Сбросить выделенную область">❌ Сброс</button>
+                                </div>
+                                <div style="display:flex; gap:4px; align-items:center; font-size:11px; color:#94a3b8;">
+                                    <span>🔍 Зум:</span>
+                                    <button type="button" id="btn-tl-zoom-1" onclick="window.__karaokeStudio.setZoom(1)" style="background:#0284c7; color:#fff; border:none; padding:3px 8px; border-radius:4px; cursor:pointer;">1x</button>
+                                    <button type="button" id="btn-tl-zoom-2" onclick="window.__karaokeStudio.setZoom(2)" style="background:#1e293b; color:#fff; border:none; padding:3px 8px; border-radius:4px; cursor:pointer;">2x</button>
+                                    <button type="button" id="btn-tl-zoom-4" onclick="window.__karaokeStudio.setZoom(4)" style="background:#1e293b; color:#fff; border:none; padding:3px 8px; border-radius:4px; cursor:pointer;">4x</button>
+                                </div>
                             </div>
-                            <div style="display:flex; gap:4px; align-items:center; font-size:11px; color:#94a3b8;">
-                                <span>🔍 Зум:</span>
-                                <button type="button" id="btn-tl-zoom-1" onclick="window.__karaokeStudio.setZoom(1)" style="background:#0284c7; color:#fff; border:none; padding:3px 8px; border-radius:4px; cursor:pointer;">1x</button>
-                                <button type="button" id="btn-tl-zoom-2" onclick="window.__karaokeStudio.setZoom(2)" style="background:#1e293b; color:#fff; border:none; padding:3px 8px; border-radius:4px; cursor:pointer;">2x</button>
-                                <button type="button" id="btn-tl-zoom-4" onclick="window.__karaokeStudio.setZoom(4)" style="background:#1e293b; color:#fff; border:none; padding:3px 8px; border-radius:4px; cursor:pointer;">4x</button>
+
+                            <!-- Прокручиваемый холст 3 дорожек -->
+                            <div style="overflow-x:auto; width:100%; border-radius:6px; border:1px solid #1e293b;">
+                                <canvas id="karaoke-studio-canvas" width="1600" height="172" style="width:100%; height:172px; display:block; cursor:crosshair;"></canvas>
                             </div>
-                        </div>
 
-                        <!-- Прокручиваемый холст 3 дорожек -->
-                        <div style="overflow-x:auto; width:100%; border-radius:6px; border:1px solid #1e293b;">
-                            <canvas id="karaoke-studio-canvas" width="1600" height="172" style="width:100%; height:172px; display:block; cursor:crosshair;"></canvas>
-                        </div>
-
-                        <div id="timeline-sel-info" style="margin-top:8px; font-size:12px; color:#cbd5e1; font-family:monospace;">
-                            💡 Потяните мышкой по любой дорожке для выделения участка или кликните по фразе
-                        </div>
-
-                        <!-- Управление уровнем вокала на выделенном участке -->
-                        <div style="margin-top:8px; padding-top:8px; border-top:1px solid #1e293b; display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
-                            <span style="font-size:12px; color:#fbbf24; font-weight:bold;">🎤 Вокал:</span>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(1.0)" style="background:#ea580c; color:#fff; border:none; padding:4px 9px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🔥 100% Оригинал</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.75)" style="background:#d97706; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">75%</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.50)" style="background:#b45309; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">🎙️ 50% Бэк</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.25)" style="background:#78350f; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">25%</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.0)" style="background:#374151; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">🔇 0% Чистый минус</button>
-                            <div style="display:flex; align-items:center; gap:4px; background:#1e293b; padding:2px 8px; border-radius:4px;">
-                                <input type="range" id="tl-custom-vocal-range" min="0" max="100" value="60" style="width:75px; cursor:pointer;" oninput="document.getElementById('tl-custom-vocal-val').textContent=this.value+'%'; window.__karaokeStudio.setSelectionVocal(Number(this.value)/100);" />
-                                <span id="tl-custom-vocal-val" style="font-size:11px; color:#fde047; font-family:monospace; min-width:32px;">60%</span>
+                            <div id="timeline-sel-info" style="margin-top:8px; font-size:12px; color:#cbd5e1; font-family:monospace;">
+                                💡 Потяните мышкой по любой дорожке для выделения участка или кликните по фразе
                             </div>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(null)" style="background:#4b5563; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">↩️ Сброс</button>
-                        </div>
 
-                        <!-- Управление эффектами FX на выделенном участке -->
-                        <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:5px; align-items:center;">
-                            <span style="font-size:12px; color:#c084fc; font-weight:bold;">✨ Эффекты:</span>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('sparkles_pulse', 0.85)" style="background:#9333ea; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">✨ Блестки + Неон</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('pulse', 0.90)" style="background:#0891b2; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">💓 Неон-Рамка</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('sparkles', 0.85)" style="background:#ca8a04; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">🌟 Блестки</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('climax', 1.0)" style="background:#db2777; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🔥 ПРИПЕВ MAX</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('police_strobe', 1.0)" style="background:#dc2626; border:1px solid #2563eb; color:#fff; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🚨 Мигалка</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX(null)" style="background:#4b5563; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">❌ Убрать FX</button>
-                            <button type="button" onclick="window.__karaokeStudio.clearAll()" style="background:#1e293b; color:#94a3b8; border:1px solid #475569; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer; margin-left:auto;">🗑️ Очистить все</button>
-                        </div>
+                            <!-- Управление уровнем вокала на выделенном участке -->
+                            <div style="margin-top:8px; padding-top:8px; border-top:1px solid #1e293b; display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
+                                <span style="font-size:12px; color:#fbbf24; font-weight:bold;">🎤 Вокал:</span>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(1.0)" style="background:#ea580c; color:#fff; border:none; padding:4px 9px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🔥 100% Оригинал</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.75)" style="background:#d97706; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">75%</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.50)" style="background:#b45309; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">🎙️ 50% Бэк</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.25)" style="background:#78350f; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">25%</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(0.0)" style="background:#374151; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">🔇 0% Чистый минус</button>
+                                <div style="display:flex; align-items:center; gap:4px; background:#1e293b; padding:2px 8px; border-radius:4px;">
+                                    <input type="range" id="tl-custom-vocal-range" min="0" max="100" value="60" style="width:75px; cursor:pointer;" oninput="document.getElementById('tl-custom-vocal-val').textContent=this.value+'%'; window.__karaokeStudio.setSelectionVocal(Number(this.value)/100);" />
+                                    <span id="tl-custom-vocal-val" style="font-size:11px; color:#fde047; font-family:monospace; min-width:32px;">60%</span>
+                                </div>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionVocal(null)" style="background:#4b5563; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">↩️ Сброс</button>
+                            </div>
 
-                        <!-- Выбор летящих эмодзи на участке -->
-                        <div style="margin-top:6px; padding-top:6px; border-top:1px dashed #334155; display:flex; flex-wrap:wrap; gap:5px; align-items:center;">
-                            <span style="font-size:12px; color:#fb923c; font-weight:bold;">🎉 Салют эмодзи:</span>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🔥')" style="background:#1e293b; border:1px solid #ea580c; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🔥 Огонь</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🎤')" style="background:#1e293b; border:1px solid #38bdf8; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🎤 Вокал</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '👑')" style="background:#1e293b; border:1px solid #eab308; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">👑 Корона</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '✨')" style="background:#1e293b; border:1px solid #a855f7; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">✨ Звёзды</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '💔')" style="background:#1e293b; border:1px solid #ec4899; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">💔 Сердце</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🚀')" style="background:#1e293b; border:1px solid #06b6d4; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🚀 Ракета</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '💣')" style="background:#1e293b; border:1px solid #ef4444; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">💣 Бомба</button>
-                            <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🥂')" style="background:#1e293b; border:1px solid #f59e0b; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🥂 Тост</button>
+                            <!-- Управление эффектами FX на выделенном участке -->
+                            <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:5px; align-items:center;">
+                                <span style="font-size:12px; color:#c084fc; font-weight:bold;">✨ Эффекты:</span>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('sparkles_pulse', 0.85)" style="background:#9333ea; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">✨ Блестки + Неон</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('pulse', 0.90)" style="background:#0891b2; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">💓 Неон-Рамка</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('sparkles', 0.85)" style="background:#ca8a04; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">🌟 Блестки</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('climax', 1.0)" style="background:#db2777; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🔥 ПРИПЕВ MAX</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('police_strobe', 1.0)" style="background:#dc2626; border:1px solid #2563eb; color:#fff; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🚨 Мигалка</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX(null)" style="background:#4b5563; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">❌ Убрать FX</button>
+                                <button type="button" onclick="window.__karaokeStudio.clearAll()" style="background:#1e293b; color:#94a3b8; border:1px solid #475569; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer; margin-left:auto;">🗑️ Очистить все</button>
+                            </div>
 
-                            <div style="display:flex; align-items:center; gap:4px; margin-left:4px;">
-                                <input type="text" id="tl-custom-emoji-input" placeholder="Свои эмодзи (🎉⚡️)" style="width:115px; background:#0f172a; color:#fff; border:1px solid #475569; border-radius:4px; padding:3px 6px; font-size:11px;" />
-                                <button type="button" onclick="window.__karaokeStudio.applyCustomEmojiFX()" style="background:#ea580c; color:#fff; border:none; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🚀 Добавить</button>
+                            <!-- Выбор летящих эмодзи на участке -->
+                            <div style="margin-top:6px; padding-top:6px; border-top:1px dashed #334155; display:flex; flex-wrap:wrap; gap:5px; align-items:center;">
+                                <span style="font-size:12px; color:#fb923c; font-weight:bold;">🎉 Салют эмодзи:</span>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🔥')" style="background:#1e293b; border:1px solid #ea580c; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🔥 Огонь</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🎤')" style="background:#1e293b; border:1px solid #38bdf8; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🎤 Вокал</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '👑')" style="background:#1e293b; border:1px solid #eab308; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">👑 Корона</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '✨')" style="background:#1e293b; border:1px solid #a855f7; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">✨ Звёзды</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '💔')" style="background:#1e293b; border:1px solid #ec4899; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">💔 Сердце</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🚀')" style="background:#1e293b; border:1px solid #06b6d4; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🚀 Ракета</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '💣')" style="background:#1e293b; border:1px solid #ef4444; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">💣 Бомба</button>
+                                <button type="button" onclick="window.__karaokeStudio.setSelectionFX('emoji_burst', 0.9, '🥂')" style="background:#1e293b; border:1px solid #f59e0b; color:#fff; padding:3px 7px; border-radius:4px; font-size:11px; cursor:pointer;">🥂 Тост</button>
+
+                                <div style="display:flex; align-items:center; gap:4px; margin-left:4px;">
+                                    <input type="text" id="tl-custom-emoji-input" placeholder="Свои эмодзи (🎉⚡️)" style="width:115px; background:#0f172a; color:#fff; border:1px solid #475569; border-radius:4px; padding:3px 6px; font-size:11px;" />
+                                    <button type="button" onclick="window.__karaokeStudio.applyCustomEmojiFX()" style="background:#ea580c; color:#fff; border:none; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold; cursor:pointer;">🚀 Добавить</button>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                    """
+                        """
+                    )
+                    with gr.Row():
+                        auto_fx_btn = gr.Button("⚡ Авто-разметка эффектов на припевы и кульминации", variant="secondary", size="sm")
+                        rebuild_stage_btn = gr.Button("🔄 Пересобрать видео в 1080p", variant="primary", size="sm")
+                        cancel_stage_btn = gr.Button("🛑 Отменить генерацию", variant="stop", size="sm")
+
+                # Offscreen DOM textboxes (visible=True so Gradio 6 mounts <textarea> in DOM, hidden via CSS)
+                with gr.Column(elem_id="studio-hidden-sync-bridge"):
+                    vocal_intervals_box = gr.Textbox(visible=True, interactive=True, container=False, elem_id="vocal-intervals-json")
+                    fx_intervals_box = gr.Textbox(visible=True, interactive=True, container=False, elem_id="fx-intervals-json")
+                    studio_data_box = gr.Textbox(visible=True, interactive=True, container=False, elem_id="studio-timeline-data-json")
+
+                audio_preview = gr.Audio(
+                    label="🎧 Чистая дорожка вокала (vocals.wav — автоматически синхронизирована с плеером)",
+                    elem_id="karaoke-vocal-audio",
+                    interactive=False,
+                    waveform_options=gr.WaveformOptions(show_recording_waveform=False),
                 )
-                with gr.Row():
-                    auto_fx_btn = gr.Button("⚡ Авто-разметка эффектов на припевы и кульминации", variant="secondary", size="sm")
-                    rebuild_stage_btn = gr.Button("🔄 Пересобрать видео в 1080p", variant="primary", size="sm")
-                    cancel_stage_btn = gr.Button("🛑 Отменить генерацию", variant="stop", size="sm")
 
-            # Offscreen DOM textboxes (visible=True so Gradio 6 mounts <textarea> in DOM, hidden via CSS)
-            with gr.Column(elem_id="studio-hidden-sync-bridge"):
-                vocal_intervals_box = gr.Textbox(visible=True, interactive=True, container=False, elem_id="vocal-intervals-json")
-                fx_intervals_box = gr.Textbox(visible=True, interactive=True, container=False, elem_id="fx-intervals-json")
-                studio_data_box = gr.Textbox(visible=True, interactive=True, container=False, elem_id="studio-timeline-data-json")
+            # ПРАВАЯ КОЛОНКА (scale=5): Вкладки студии (Текст, Проект, Оформление)
+            with gr.Column(scale=5, elem_id="tools-right-column"):
+                with gr.Tabs(elem_id="studio-tabs"):
+                    # Вкладка 1: Текст и тайминги
+                    with gr.Tab("📝 Текст и тайминги", id="tab-lyrics"):
+                        with gr.Row():
+                            realign_btn = gr.Button("⏱️ Пересчитать тайминги", variant="primary", size="sm")
+                            seek_line_btn = gr.Button("▶️ К строке в видео", variant="secondary", size="sm")
+                        with gr.Row():
+                            regroup_btn = gr.Button("✨ Авто-склейка коротких", variant="secondary", size="sm")
+                            split_btn = gr.Button("✂️ Разделить длинные", variant="secondary", size="sm")
+                        editor_box = gr.Textbox(
+                            label="Построчный текст караоке с таймкодами",
+                            lines=18,
+                            interactive=True,
+                            elem_id="karaoke-lyrics-editor",
+                        )
+                        with gr.Accordion("📋 Вставить готовый текст песни целиком (без таймкодов)", open=False):
+                            raw_lyrics_box = gr.Textbox(
+                                label="Вставьте чистый текст песни из интернета",
+                                placeholder="Вставьте сюда текст песни и нажмите кнопку ниже...",
+                                lines=6,
+                            )
+                            apply_raw_lyrics_btn = gr.Button("⚡ Заменить текст и выровнять по вокалу", variant="secondary")
 
-            audio_preview = gr.Audio(
-                label="🎧 Чистая дорожка вокала (vocals.wav — автоматически синхронизирована с плеером)",
-                elem_id="karaoke-vocal-audio",
-                interactive=False,
-                waveform_options=gr.WaveformOptions(show_recording_waveform=False),
-            )
+                        with gr.Row():
+                            rebuild_btn = gr.Button(
+                                "🔄 Пересобрать видео в 1080p",
+                                variant="primary",
+                                size="lg",
+                                scale=3,
+                            )
+                            cancel_left_btn = gr.Button(
+                                "🛑 Стоп",
+                                variant="stop",
+                                size="lg",
+                                scale=1,
+                            )
+
+                    # Вкладка 2: Проект и источники
+                    with gr.Tab("📂 Проект и источники", id="tab-sources"):
+                        with gr.Accordion("📂 Открыть сохраненный проект из кэша", open=True):
+                            with gr.Row():
+                                saved_dropdown = gr.Dropdown(
+                                    label="Проекты в output/work",
+                                    choices=list_saved_states(),
+                                    value=list_saved_states()[0] if list_saved_states() else None,
+                                    interactive=True,
+                                )
+                                load_btn = gr.Button("📂 Загрузить", variant="secondary")
+
+                        with gr.Group():
+                            gr.Markdown("### Источник трека")
+                            url_box = gr.Textbox(
+                                label="🔗 Ссылка на YouTube / видео",
+                                placeholder="https://www.youtube.com/watch?v=...",
+                            )
+                            use_video_bg_cb = gr.Checkbox(
+                                label="🎬 Использовать оригинальное видео с YouTube как фон",
+                                value=False,
+                                info="Скачивает клип с YouTube в 1080p и накладывает караоке-текст прямо поверх видео",
+                            )
+                            with gr.Accordion("🍪 Настройки YouTube (cookies)", open=False):
+                                gr.Markdown(
+                                    "Если YouTube пишет *«Sign in to confirm you’re not a bot»*, выберите браузер, "
+                                    "в котором выполнен вход в YouTube, или загрузите файл cookies.txt."
+                                )
+                                cookie_browser_radio = gr.Radio(
+                                    label="🌐 Браузер для импорта cookies",
+                                    choices=[
+                                        ("Google Chrome (по умолчанию)", "chrome"),
+                                        ("Chromium", "chromium"),
+                                        ("Firefox", "firefox"),
+                                        ("Safari", "safari"),
+                                        ("Edge", "edge"),
+                                        ("Brave", "brave"),
+                                        ("Vivaldi", "vivaldi"),
+                                        ("Opera", "opera"),
+                                        ("Свой файл cookies.txt", "file"),
+                                        ("Без cookies (анонимно)", "none"),
+                                    ],
+                                    value="chrome",
+                                )
+                                cookie_file_input = gr.File(
+                                    label="📄 Файл cookies.txt (Netscape формат)",
+                                    file_types=[".txt"],
+                                    visible=False,
+                                )
+                            file_box = gr.File(
+                                label="🎵 Трек: аудио или видео",
+                                file_types=["audio", "video"],
+                                type="filepath",
+                                elem_id="track-upload",
+                            )
+                            gr.Markdown("Перетащите аудио- или видеофайл. Загруженный файл используется вместо ссылки.")
+
+                        with gr.Accordion("⚙️ Модели нейросетей & Свой текст", open=False):
+                            model_dropdown = gr.Dropdown(
+                                label="Распознавание речи (Whisper)",
+                                choices=[
+                                    ("large-v3-turbo (Рекомендуется: быстрая, идеальна для песен, оперы, высоких нот)", "large-v3-turbo"),
+                                    ("bond005/whisper-podlodka-turbo (Русский fine-tune Whisper Turbo)", "bond005/whisper-podlodka-turbo"),
+                                    ("antony66/whisper-large-v3-russian (Русский fine-tune для обычной речи)", "antony66/whisper-large-v3-russian"),
+                                    ("large-v3 (Базовая большая модель OpenAI)", "large-v3"),
+                                    ("medium (Средняя модель)", "medium"),
+                                    ("small (Быстрая легкая модель)", "small"),
+                                ],
+                                value="large-v3-turbo",
+                            )
+                            demucs_dropdown = gr.Dropdown(
+                                label="Отделение вокала (Demucs)",
+                                choices=[
+                                    ("htdemucs (Быстрая Hybrid Transformer — 30 сек)", "htdemucs"),
+                                    ("htdemucs_ft (4x HQ Studio Fine-Tuned Ensemble — лучшее разделение)", "htdemucs_ft"),
+                                    ("hdemucs_mmi (Hybrid Demucs MMI)", "hdemucs_mmi"),
+                                    ("mdx_extra (MDX-Net Extra)", "mdx_extra"),
+                                ],
+                                value="htdemucs",
+                            )
+                            lang_box = gr.Textbox(label="Код языка", value="ru")
+                            ctc_checkbox = gr.Checkbox(
+                                label="Кириллическое CTC выравнивание (Wav2Vec2)",
+                                value=False,
+                            )
+                            ref_lyrics_box = gr.Textbox(
+                                label="Вставьте текст песни (опционально)",
+                                placeholder="Если вставить текст песни до запуска, нейросеть разобьет куплеты строго по строкам...",
+                                lines=8,
+                                max_lines=30,
+                            )
+
+                        with gr.Row():
+                            run_btn = gr.Button("🚀 Создать караоке", variant="primary", size="lg", scale=3)
+                            cancel_right_btn = gr.Button("🛑 Отменить", variant="stop", size="lg", scale=1, elem_id="cancel-main-btn")
+
+                    # Вкладка 3: Оформление, фон и звук
+                    with gr.Tab("🎨 Оформление и звук", id="tab-design"):
+                        with gr.Group():
+                            gr.Markdown("### Оформление и эффекты")
+                            edge_color_radio = gr.Radio(
+                                label="🌈 Стиль и цвета неоновой рамки",
+                                choices=[
+                                    ("⚡ Киберпанк (Неон-циан + Маджента + Фиолет)", "cyberpunk"),
+                                    ("🌸 Розовый (Hot Pink / Synthwave)", "pink"),
+                                    ("❄️ Голубой (Electric Ice Blue)", "blue"),
+                                    ("🔮 Фиолетовый (Deep Violet / Neon Purple)", "purple"),
+                                    ("🔥 Огонь (Fire Orange & Gold)", "fire"),
+                                    ("🎨 Цвета обложки (Ambilight)", "cover_colors"),
+                                    ("🌈 Радуга (Иридесцентные переливы)", "neon_rainbow"),
+                                    ("🚨 Полицейская мигалка (Красный + Синий стробоскоп)", "police"),
+                                ],
+                                value="cyberpunk",
+                            )
+                            font_size_radio = gr.Radio(
+                                label="🔤 Размер шрифта текста",
+                                choices=[
+                                    ("Стандартный (54px)", "standard"),
+                                    ("Крупный (64px, контрастный — по умолчанию)", "large"),
+                                    ("Огромный (74px)", "huge"),
+                                ],
+                                value="large",
+                            )
+                            highlight_color_radio = gr.Radio(
+                                label="🌟 Цвет караоке-выделения (Свип)",
+                                choices=[
+                                    ("Золотой неон (#FFDF00)", "gold_neon"),
+                                    ("Электрик циан (#00F0FF)", "electric_cyan"),
+                                    ("Неон маджента (#FF1493)", "neon_magenta"),
+                                    ("Кислотный лайм (#39FF14)", "acid_lime"),
+                                    ("Огненный оранж (#FF6A00)", "fire_orange"),
+                                ],
+                                value="gold_neon",
+                            )
+                            fx_dropdown = gr.Dropdown(
+                                label="✨ Режим спецэффектов",
+                                choices=[
+                                    ("✨ Блестки + Неон-пульсация рамки (Рекомендуется)", "sparkles_pulse"),
+                                    ("🔥 Салют эмодзи (летящие частицы на припевах)", "emoji_burst"),
+                                    ("🔮 Эмодзи + Неон-пульсация рамки", "emoji_pulse"),
+                                    ("💓 Только пульсация всего периметра 1920x1080", "pulse"),
+                                    ("🌟 Только летящие блестки и боке", "sparkles"),
+                                    ("🚨 Полицейская мигалка (красно-синий стробоскоп)", "police_strobe"),
+                                    ("💥 Эпичный припев (мощный неон + двойные блестки)", "climax"),
+                                    ("🎯 Только зоны с дорожки FX (по таймлайну)", "timeline_only"),
+                                    ("Без эффектов", "none"),
+                                ],
+                                value="sparkles_pulse",
+                            )
+                            lines_radio = gr.Radio(
+                                choices=[3, 4],
+                                value=4,
+                                label="📺 Строк телесуфлера",
+                                info="Активная строка всегда по центру",
+                            )
+
+                        with gr.Group():
+                            gr.Markdown("### Фон видео")
+                            bg_box = gr.File(
+                                label="🖼️ Фоновая картинка или видео",
+                                file_types=["image", "video"],
+                                type="filepath",
+                                elem_id="background-upload",
+                            )
+                            background_preview = gr.Image(
+                                label="Предпросмотр фоновой картинки",
+                                interactive=False,
+                                visible=False,
+                                height=220,
+                                elem_id="background-preview",
+                            )
+                            use_cover_cb = gr.Checkbox(
+                                label="🖼️ Обложка трека как фон (Apple Music 1080p Blur)",
+                                value=True,
+                                info="Четкий Full HD задник с карточкой трека и эффектами",
+                            )
+                            cover_preview = gr.Image(
+                                label="Найденная обложка трека",
+                                interactive=False,
+                                height=100,
+                            )
+
+                        with gr.Group():
+                            gr.Markdown("### Звук и DJ-Экспорт")
+                            vocal_vol_slider = gr.Slider(
+                                minimum=0,
+                                maximum=100,
+                                value=0,
+                                step=1,
+                                label="🎙️ Базовый вокал в минусовке (Guide %)",
+                                info="По умолчанию 0% — чистая минусовка. Отдельные участки можно настроить на таймлайне.",
+                            )
+                            video_quality_radio = gr.Radio(
+                                label="Битрейт и скорость рендера (1080p)",
+                                choices=[
+                                    ("Web Light (~2.2 Mbps, небольшой размер файла)", "light"),
+                                    ("Balanced 1080p (~4.2 Mbps, рекомендовано)", "balanced"),
+                                    ("Studio HQ (~8.5 Mbps, архивное качество)", "hq"),
+                                ],
+                                value="balanced",
+                            )
+                            dual_audio_cb = gr.Checkbox(
+                                label="🎚️ Dual-Audio MP4 (зашивать 2-ю аудиодорожку со 100% вокалом)",
+                                value=True,
+                            )
+                            watermark_box = gr.Textbox(
+                                label="🏷️ Брендинг / Водяной знак DJ или Клуба (в правом верхнем углу)",
+                                placeholder="Например: Karaoke by DJ Alex · Заказ песен: @djalex",
+                                value="",
+                            )
+                            export_dj_btn = gr.Button(
+                                "📦 Собрать универсальный DJ-пак (.KFN + .CDG + .LRC + UltraStar + MP3 стемы)",
+                                variant="secondary",
+                            )
+                            dj_pack_files = gr.File(
+                                label="📥 Готовые файлы DJ-пака (.zip и .kfn)",
+                                file_count="multiple",
+                                interactive=False,
+                                visible=False,
+                            )
 
         bg_box.change(fn=preview_background_image, inputs=[bg_box], outputs=[background_preview], queue=False)
 
@@ -2102,6 +2238,45 @@ def build_ui():
             outputs=[dj_pack_files, status_box],
             concurrency_id="karaoke_generation",
             concurrency_limit=1,
+        )
+
+        realign_btn.click(
+            fn=sync_timeline_boxes_ui,
+            inputs=[vocal_intervals_box, fx_intervals_box],
+            outputs=[vocal_intervals_box, fx_intervals_box],
+            js=SYNC_TIMELINE_TO_GRADIO_JS,
+            queue=False,
+        ).then(
+            fn=realign_project_timings_ui,
+            inputs=[state_store, editor_box, vocal_intervals_box, fx_intervals_box],
+            outputs=[state_store, editor_box, studio_data_box, status_box],
+        ).then(
+            fn=None,
+            inputs=[studio_data_box],
+            js=PUSH_TIMELINE_JSON_JS,
+        )
+
+        apply_raw_lyrics_btn.click(
+            fn=sync_timeline_boxes_ui,
+            inputs=[vocal_intervals_box, fx_intervals_box],
+            outputs=[vocal_intervals_box, fx_intervals_box],
+            js=SYNC_TIMELINE_TO_GRADIO_JS,
+            queue=False,
+        ).then(
+            fn=apply_raw_lyrics_ui,
+            inputs=[state_store, raw_lyrics_box, vocal_intervals_box, fx_intervals_box],
+            outputs=[state_store, editor_box, studio_data_box, status_box],
+        ).then(
+            fn=None,
+            inputs=[studio_data_box],
+            js=PUSH_TIMELINE_JSON_JS,
+        )
+
+        seek_line_btn.click(
+            fn=None,
+            inputs=None,
+            outputs=None,
+            js="() => { if (window.__karaokeStudio) window.__karaokeStudio.seekToCurrentEditorLine(); }",
         )
 
         regroup_btn.click(
