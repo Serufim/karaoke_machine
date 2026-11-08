@@ -1,6 +1,6 @@
 [project]
 name = "karaoke-generator"
-version = "0.5.1"
+version = "0.5.2"
 description = "Fully local, automatic AI karaoke video generator optimized for Russian/Cyrillic"
 readme = "README.md"
 requires-python = ">=3.10,<3.12"

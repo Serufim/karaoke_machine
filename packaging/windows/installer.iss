@@ -2,7 +2,7 @@
 ; Generates AIKaraokeStudio-Setup.exe
 
 #define MyAppName "AI Karaoke Studio"
-#define MyAppVersion "0.5.1"
+#define MyAppVersion "0.5.2"
 #define MyAppPublisher "Serufim"
 #define MyAppURL "https://github.com/Serufim/karaoke_machine"
 #define MyAppExeName "AIKaraokeStudio.exe"
