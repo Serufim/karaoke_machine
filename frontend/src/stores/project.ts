@@ -1,6 +1,14 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { ProjectMeta, ProjectState, VocalInterval, FxInterval, EmojiInterval } from '@/types'
+import type {
+  ProjectMeta,
+  ProjectState,
+  VocalInterval,
+  FxInterval,
+  EmojiInterval,
+  TimingSnapshotMeta,
+  LineTimingDiff,
+} from '@/types'
 
 function formatEditorTime(sec: number): string {
   if (!sec || isNaN(sec) || sec < 0) sec = 0
@@ -109,11 +117,14 @@ export const useProjectStore = defineStore('project', () => {
       const data: ProjectState = await res.json()
       data.emoji_intervals = data.emoji_intervals || []
       currentProject.value = data
+      pendingRealignIndices.value = []
+      liveOverlayEnabled.value = false
       history.value = []
       historyIndex.value = -1
       pushHistory()
       isDirty.value = false
       mediaTimestamp.value = Date.now()
+      await fetchTimingHistory(projectTitle)
     } catch (e: any) {
       errorMessage.value = e.message
     } finally {
@@ -166,30 +177,94 @@ export const useProjectStore = defineStore('project', () => {
     pushHistory()
   }
 
-  function shiftLineTiming(lineIndex: number, newStart: number, newEnd: number) {
-    if (!currentProject.value || !currentProject.value.lines) return
-    const line = currentProject.value.lines[lineIndex]
+  const pendingRealignIndices = ref<number[]>([])
+  const liveOverlayEnabled = ref<boolean>(false)
+
+  function addPendingRealign(lineIndex: number) {
+    if (!pendingRealignIndices.value.includes(lineIndex)) {
+      pendingRealignIndices.value = [...pendingRealignIndices.value, lineIndex].sort((a, b) => a - b)
+    }
+  }
+
+  function removePendingRealign(lineIndex: number) {
+    pendingRealignIndices.value = pendingRealignIndices.value.filter((i) => i !== lineIndex)
+  }
+
+  function clearPendingRealign() {
+    pendingRealignIndices.value = []
+  }
+
+  function rescaleLineInPlace(line: any, newStart: number, newEnd: number) {
     if (!line) return
-
-    newStart = Math.max(0, Number(newStart.toFixed(2)))
-    newEnd = Math.max(newStart + 0.15, Number(newEnd.toFixed(2)))
-
     if (Array.isArray(line) && line.length > 0) {
       const oldStart = Number(line[0].start ?? 0)
       const oldEnd = Number(line[line.length - 1].end ?? oldStart + 1.0)
       const oldDur = Math.max(0.01, oldEnd - oldStart)
-      const newDur = newEnd - newStart
+      const newDur = Math.max(0.08 * line.length, newEnd - newStart)
 
       for (const w of line) {
         const relS = (Number(w.start ?? oldStart) - oldStart) / oldDur
         const relE = (Number(w.end ?? oldEnd) - oldStart) / oldDur
         w.start = Number((newStart + relS * newDur).toFixed(2))
         w.end = Number((newStart + relE * newDur).toFixed(2))
+        if (Array.isArray(w.syllable_timings)) {
+          for (const st of w.syllable_timings) {
+            const sRel = (Number(st.start ?? oldStart) - oldStart) / oldDur
+            const eRel = (Number(st.end ?? oldEnd) - oldStart) / oldDur
+            st.start = Number((newStart + sRel * newDur).toFixed(3))
+            st.end = Number((newStart + eRel * newDur).toFixed(3))
+          }
+        }
       }
-    } else if (line) {
+    } else {
       line.start = newStart
       line.end = newEnd
     }
+  }
+
+  function shiftLineTiming(lineIndex: number, newStart: number, newEnd: number) {
+    if (!currentProject.value || !currentProject.value.lines) return
+    const lines = currentProject.value.lines
+    const line = lines[lineIndex]
+    if (!line) return
+
+    newStart = Math.max(0, Number(newStart.toFixed(2)))
+    newEnd = Math.max(newStart + 0.15, Number(newEnd.toFixed(2)))
+
+    // Trim overlapping neighbours so user-stretched bounds are preserved across realign/rebuild
+    if (lineIndex > 0 && Array.isArray(lines[lineIndex - 1]) && lines[lineIndex - 1].length > 0) {
+      const prev = lines[lineIndex - 1]
+      const prevStart = Number(prev[0].start ?? 0)
+      const prevEnd = Number(prev[prev.length - 1].end ?? 0)
+      if (prevEnd > newStart) {
+        const minPrevDur = 0.08 * prev.length
+        if (newStart - prevStart >= minPrevDur) {
+          rescaleLineInPlace(prev, prevStart, newStart)
+        } else {
+          newStart = Number((prevStart + minPrevDur).toFixed(2))
+          rescaleLineInPlace(prev, prevStart, newStart)
+          if (newEnd < newStart + 0.15) newEnd = Number((newStart + 0.15).toFixed(2))
+        }
+      }
+    }
+    if (lineIndex + 1 < lines.length && Array.isArray(lines[lineIndex + 1]) && lines[lineIndex + 1].length > 0) {
+      const nxt = lines[lineIndex + 1]
+      const nxtStart = Number(nxt[0].start ?? 0)
+      const nxtEnd = Number(nxt[nxt.length - 1].end ?? 0)
+      if (nxtStart < newEnd) {
+        const minNxtDur = 0.08 * nxt.length
+        if (nxtEnd - newEnd >= minNxtDur) {
+          rescaleLineInPlace(nxt, newEnd, nxtEnd)
+        } else {
+          newEnd = Number(Math.max(newStart + 0.15, nxtEnd - minNxtDur).toFixed(2))
+          rescaleLineInPlace(nxt, newEnd, nxtEnd)
+        }
+      }
+    }
+
+    rescaleLineInPlace(line, newStart, newEnd)
+    addPendingRealign(lineIndex)
+    liveOverlayEnabled.value = true
 
     currentProject.value.editor_text = rebuildEditorTextFromLines(currentProject.value.lines)
     pushHistory()
@@ -283,6 +358,117 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  async function optimizeTimings(targetScore = 90) {
+    if (!currentProject.value) return null
+    try {
+      const title = encodeURIComponent(currentProject.value.title)
+      const res = await fetch(`/api/project/${title}/optimize-timings?target_score=${targetScore}`, {
+        method: 'POST',
+      })
+      if (!res.ok) throw new Error('Ошибка автоподгонки таймингов')
+      const data = await res.json()
+      currentProject.value.editor_text = data.editor_text
+      currentProject.value.lines = data.lines
+      if (data.alignment_report) {
+        currentProject.value.alignment_report = data.alignment_report
+      }
+      pushHistory()
+      await fetchTimingHistory(currentProject.value.title)
+      return data
+    } catch (e: any) {
+      errorMessage.value = e.message
+      throw e
+    }
+  }
+
+  const timingHistory = ref<TimingSnapshotMeta[]>([])
+  const lineMarkByIdx = ref<Record<string, 'good' | 'bad'>>({})
+  const diffVsPrevious = ref<Array<LineTimingDiff | null>>([])
+
+  async function fetchTimingHistory(projectTitle?: string) {
+    const t = projectTitle || currentProject.value?.title
+    if (!t) return
+    try {
+      const res = await fetch(`/api/project/${encodeURIComponent(t)}/timing-history`)
+      if (!res.ok) return
+      const data = await res.json()
+      timingHistory.value = data.snapshots || []
+      lineMarkByIdx.value = data.line_mark_by_idx || {}
+      diffVsPrevious.value = data.diff_vs_previous || []
+    } catch {
+      // ignore non-fatal history load errors
+    }
+  }
+
+  async function setLineMark(lineIdx: number, mark: 'good' | 'bad' | null) {
+    if (!currentProject.value) return
+    const title = encodeURIComponent(currentProject.value.title)
+    const res = await fetch(`/api/project/${title}/line-mark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ line_idx: lineIdx, mark }),
+    })
+    if (!res.ok) throw new Error('Не удалось сохранить отметку строки')
+    const data = await res.json()
+    lineMarkByIdx.value = data.line_mark_by_idx || {}
+  }
+
+  async function restoreTimingSnapshot(snapId: string) {
+    if (!currentProject.value) return
+    const title = encodeURIComponent(currentProject.value.title)
+    const res = await fetch(`/api/project/${title}/timing-history/${encodeURIComponent(snapId)}/restore`, {
+      method: 'POST',
+    })
+    if (!res.ok) throw new Error('Не удалось восстановить версию таймингов')
+    const data = await res.json()
+    currentProject.value.lines = data.lines
+    currentProject.value.editor_text = data.editor_text
+    if (data.alignment_report) {
+      currentProject.value.alignment_report = data.alignment_report
+    }
+    pushHistory()
+    await fetchTimingHistory(currentProject.value.title)
+  }
+
+  async function realignChangedByVocals(lineIndices?: number[]) {
+    if (!currentProject.value) return null
+    const title = encodeURIComponent(currentProject.value.title)
+    const res = await fetch(`/api/project/${title}/realign-changed-by-vocals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        editor_text: currentProject.value.editor_text,
+        lines: currentProject.value.lines,
+        line_indices: lineIndices && lineIndices.length ? lineIndices : undefined,
+      }),
+    })
+    if (!res.ok) throw new Error('Ошибка пересчёта изменённых строк по вокалу')
+    const data = await res.json()
+    if (data.status === 'ok') {
+      currentProject.value.lines = data.lines
+      currentProject.value.editor_text = data.editor_text
+      if (data.alignment_report) {
+        currentProject.value.alignment_report = data.alignment_report
+      }
+      pushHistory()
+      await fetchTimingHistory(currentProject.value.title)
+      liveOverlayEnabled.value = true
+    }
+    return data
+  }
+
+  async function realignPendingLines() {
+    if (!currentProject.value || pendingRealignIndices.value.length === 0) return null
+    const target = [...pendingRealignIndices.value]
+    const data = await realignChangedByVocals(target)
+    if (data?.status === 'ok') {
+      const updatedSet = new Set<number>(data.updated_indices || [])
+      pendingRealignIndices.value = pendingRealignIndices.value.filter((i) => !updatedSet.has(i))
+      liveOverlayEnabled.value = true
+    }
+    return data
+  }
+
   async function uploadCover(file: File) {
     if (!currentProject.value) return
     errorMessage.value = null
@@ -362,6 +548,20 @@ export const useProjectStore = defineStore('project', () => {
     splitLongLines,
     autoDetectFx,
     realignTimings,
+    optimizeTimings,
+    timingHistory,
+    lineMarkByIdx,
+    diffVsPrevious,
+    fetchTimingHistory,
+    setLineMark,
+    restoreTimingSnapshot,
+    realignChangedByVocals,
+    pendingRealignIndices,
+    liveOverlayEnabled,
+    addPendingRealign,
+    removePendingRealign,
+    clearPendingRealign,
+    realignPendingLines,
     undo,
     redo,
     canUndo: computed(() => historyIndex.value > 0),

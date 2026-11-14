@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from PIL import Image
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -53,6 +53,13 @@ router = APIRouter(prefix="/api")
 
 OUTPUT_DIR = Path("./output").resolve()
 WORK_DIR = OUTPUT_DIR / "work"
+
+
+def notify_project_updated(title: str) -> None:
+    ws_manager.broadcast_threadsafe({
+        "type": "project_updated",
+        "title": title,
+    })
 
 
 class DownloadModelRequest(BaseModel):
@@ -406,7 +413,7 @@ def get_project_state(title: str) -> Dict[str, Any]:
             "model_size": "large-v3-turbo",
             "demucs_model": "htdemucs",
             "vad": "auditok",
-            "use_ctc_align": False,
+            "use_ctc_align": True,
             "use_video_bg": bool(state_data.get("video_bg")),
             "condition_on_previous_text": False,
             "strict_repeats": False,
@@ -534,6 +541,218 @@ def split_lines(payload: SplitLinesRequest) -> Dict[str, Any]:
     }
 
 
+@router.post("/project/{title}/optimize-timings")
+def optimize_project_timings(title: str, target_score: float = 90.0) -> Dict[str, Any]:
+    state_file = WORK_DIR / f"{title}_state.json"
+    if not state_file.exists():
+        raise HTTPException(status_code=404, detail=f"Project '{title}' not found")
+    state_data = json.loads(state_file.read_text(encoding="utf-8"))
+    from karaoke.alignment_qa import optimize_alignment_to_target, format_alignment_report_summary
+    from karaoke import timing_history
+
+    vocals_wav = Path(state_data["vocals_wav"]) if state_data.get("vocals_wav") else None
+    lines = state_data.get("lines", [])
+    marks = state_data.get("line_marks") or []
+    locked_lines, bad_lines = timing_history.marks_to_constraints(lines, marks)
+
+    opt_lines, report = optimize_alignment_to_target(
+        lines,
+        vocals_path=vocals_wav,
+        target_score=target_score,
+        recognized_words=state_data.get("recognized_words"),
+        locked_lines=locked_lines,
+        bad_lines=bad_lines,
+    )
+    timing_history.save_snapshot(WORK_DIR, title, state_data, reason="optimize")
+    new_editor_text = lines_to_editor_text(opt_lines)
+    state_data["lines"] = opt_lines
+    state_data["editor_text"] = new_editor_text
+    state_data["alignment_report"] = report
+    state_data["line_marks"] = timing_history.refresh_mark_timings(opt_lines, marks)
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "status": "ok",
+        "lines": opt_lines,
+        "editor_text": new_editor_text,
+        "alignment_report": report,
+        "line_marks": state_data["line_marks"],
+        "summary": format_alignment_report_summary(report),
+    }
+
+
+class LineMarkRequest(BaseModel):
+    line_idx: int
+    mark: Optional[str] = None  # "good" | "bad" | None (clear)
+
+
+def _load_state_or_404(title: str) -> Tuple[Path, Dict[str, Any]]:
+    state_file = WORK_DIR / f"{title}_state.json"
+    if not state_file.exists():
+        raise HTTPException(status_code=404, detail=f"Проект '{title}' не найден.")
+    return state_file, json.loads(state_file.read_text(encoding="utf-8"))
+
+
+@router.post("/project/{title}/line-mark")
+def set_project_line_mark(title: str, payload: LineMarkRequest) -> Dict[str, Any]:
+    from karaoke import timing_history
+
+    if payload.mark not in (None, "good", "bad"):
+        raise HTTPException(status_code=400, detail="mark должен быть 'good', 'bad' или null")
+    state_file, state_data = _load_state_or_404(title)
+    lines = state_data.get("lines") or []
+    try:
+        marks = timing_history.set_line_mark(lines, state_data.get("line_marks"), payload.line_idx, payload.mark)
+    except IndexError:
+        raise HTTPException(status_code=400, detail="Неверный номер строки")
+    state_data["line_marks"] = marks
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    resolved = timing_history.resolve_marks(lines, marks)
+    return {
+        "status": "ok",
+        "line_marks": marks,
+        "line_mark_by_idx": {str(k): v for k, v in resolved.items()},
+    }
+
+
+@router.get("/project/{title}/timing-history")
+def get_project_timing_history(title: str) -> Dict[str, Any]:
+    from karaoke import timing_history
+
+    _, state_data = _load_state_or_404(title)
+    lines = state_data.get("lines") or []
+    snapshots = timing_history.list_snapshots(WORK_DIR, title)
+    resolved = timing_history.resolve_marks(lines, state_data.get("line_marks"))
+    prev_diff = None
+    if snapshots:
+        prev = timing_history.load_snapshot(WORK_DIR, title, snapshots[0]["id"])
+        if prev:
+            prev_diff = timing_history.diff_lines(prev.get("lines") or [], lines)
+    return {
+        "snapshots": snapshots,
+        "line_mark_by_idx": {str(k): v for k, v in resolved.items()},
+        "diff_vs_previous": prev_diff,
+        "current": {
+            "overall_score": (state_data.get("alignment_report") or {}).get("overall_score"),
+            "marks_summary": {
+                "good": sum(1 for v in resolved.values() if v == "good"),
+                "bad": sum(1 for v in resolved.values() if v == "bad"),
+            },
+        },
+    }
+
+
+@router.get("/project/{title}/timing-history/{snap_id}/diff")
+def get_project_timing_diff(title: str, snap_id: str) -> Dict[str, Any]:
+    from karaoke import timing_history
+
+    _, state_data = _load_state_or_404(title)
+    snap = timing_history.load_snapshot(WORK_DIR, title, snap_id)
+    if not snap:
+        raise HTTPException(status_code=404, detail="Версия не найдена")
+    return {"diff": timing_history.diff_lines(snap.get("lines") or [], state_data.get("lines") or [])}
+
+
+@router.post("/project/{title}/timing-history/{snap_id}/restore")
+def restore_project_timing_snapshot(title: str, snap_id: str) -> Dict[str, Any]:
+    from karaoke import timing_history
+
+    state_file, state_data = _load_state_or_404(title)
+    snap = timing_history.load_snapshot(WORK_DIR, title, snap_id)
+    if not snap or not snap.get("lines"):
+        raise HTTPException(status_code=404, detail="Версия не найдена")
+    timing_history.save_snapshot(WORK_DIR, title, state_data, reason="restore")
+    restored = snap["lines"]
+    state_data["lines"] = restored
+    state_data["editor_text"] = snap.get("editor_text") or lines_to_editor_text(restored)
+    try:
+        from karaoke.alignment_qa import evaluate_alignment_quality
+
+        vocals_wav = Path(state_data["vocals_wav"]) if state_data.get("vocals_wav") else None
+        state_data["alignment_report"] = evaluate_alignment_quality(restored, vocals_wav)
+    except Exception:
+        state_data["alignment_report"] = snap.get("alignment_report") or {}
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    notify_project_updated(title)
+    return {
+        "status": "ok",
+        "lines": restored,
+        "editor_text": state_data["editor_text"],
+        "alignment_report": state_data["alignment_report"],
+    }
+
+
+class RealignChangedRequest(BaseModel):
+    editor_text: Optional[str] = None
+    lines: Optional[List[Any]] = None
+    line_indices: Optional[List[int]] = None
+
+
+@router.post("/project/{title}/realign-changed-by-vocals")
+def realign_changed_project_lines_by_vocals(title: str, payload: RealignChangedRequest) -> Dict[str, Any]:
+    from karaoke import timing_history
+    from karaoke.aligner import realign_lines_by_vocals
+    from karaoke.alignment_qa import evaluate_alignment_quality
+
+    state_file, state_data = _load_state_or_404(title)
+    vocals_wav = Path(state_data["vocals_wav"]) if state_data.get("vocals_wav") else None
+    saved_lines = state_data.get("lines") or []
+
+    if payload.editor_text is not None and payload.editor_text.strip():
+        working_lines = editor_text_to_lines(
+            payload.editor_text,
+            original_lines=payload.lines or saved_lines,
+            vocals_path=vocals_wav,
+        )
+    elif payload.lines is not None:
+        working_lines = payload.lines
+    else:
+        working_lines = saved_lines
+
+    if payload.line_indices:
+        target_indices = [i for i in payload.line_indices if 0 <= i < len(working_lines)]
+    else:
+        target_indices = timing_history.find_changed_line_indices(saved_lines, working_lines)
+        if not target_indices:
+            snaps = timing_history.list_snapshots(WORK_DIR, title)
+            if snaps:
+                prev = timing_history.load_snapshot(WORK_DIR, title, snaps[0]["id"])
+                if prev:
+                    target_indices = timing_history.find_changed_line_indices(prev.get("lines") or [], working_lines)
+        if not target_indices:
+            resolved = timing_history.resolve_marks(working_lines, state_data.get("line_marks"))
+            target_indices = [idx for idx, mk in resolved.items() if mk == "bad"]
+
+    if not target_indices:
+        return {
+            "status": "noop",
+            "updated_indices": [],
+            "lines": working_lines,
+            "editor_text": lines_to_editor_text(working_lines),
+            "alignment_report": state_data.get("alignment_report"),
+        }
+
+    timing_history.save_snapshot(WORK_DIR, title, state_data, reason="realign_vocals")
+    new_lines, updated_indices = realign_lines_by_vocals(working_lines, vocals_wav, target_indices)
+    new_editor_text = lines_to_editor_text(new_lines)
+    report = evaluate_alignment_quality(new_lines, vocals_wav)
+    marks = timing_history.refresh_mark_timings(new_lines, state_data.get("line_marks"))
+
+    state_data["lines"] = new_lines
+    state_data["editor_text"] = new_editor_text
+    state_data["alignment_report"] = report
+    state_data["line_marks"] = marks
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "status": "ok",
+        "updated_indices": updated_indices,
+        "lines": new_lines,
+        "editor_text": new_editor_text,
+        "alignment_report": report,
+    }
+
+
 @router.post("/tools/realign-timings")
 def realign_timings(payload: RealignTimingsRequest) -> Dict[str, Any]:
     vocals_path = None
@@ -559,6 +778,9 @@ def realign_timings(payload: RealignTimingsRequest) -> Dict[str, Any]:
         vocals_path=vocals_path,
     )
     if state_file and state_data is not None:
+        from karaoke import timing_history
+
+        timing_history.save_snapshot(WORK_DIR, payload.title, state_data, reason="realign")
         state_data["editor_text"] = new_editor_text
         state_data["lines"] = new_lines
         state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -764,7 +986,7 @@ async def start_generate(
     demucs_model: str = Form("htdemucs"),
     language: str = Form("ru"),
     reference_lyrics: str = Form(""),
-    use_ctc_align: bool = Form(False),
+    use_ctc_align: bool = Form(True),
     use_video_bg: bool = Form(False),
     vocal_volume_pct: float = Form(0.0),
     num_lines: int = Form(4),

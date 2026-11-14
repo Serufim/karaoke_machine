@@ -20,6 +20,110 @@ const audioRef = ref<HTMLAudioElement | null>(null)
 const isMuted = ref(false)
 const mediaCacheBuster = ref(Date.now())
 const lastVocalMultiplier = ref(0.8)
+const liveTime = ref(0)
+let rafId: number | null = null
+
+function syncLiveClock() {
+  if (videoRef.value) {
+    liveTime.value = videoRef.value.currentTime
+  } else {
+    liveTime.value = playerStore.currentTime
+  }
+  if (playerStore.isPlaying && projectStore.liveOverlayEnabled) {
+    rafId = requestAnimationFrame(syncLiveClock)
+  } else {
+    rafId = null
+  }
+}
+
+watch(
+  [() => playerStore.isPlaying, () => projectStore.liveOverlayEnabled, () => playerStore.currentTime],
+  ([playing, enabled, cur]) => {
+    liveTime.value = videoRef.value ? videoRef.value.currentTime : cur
+    if (playing && enabled && rafId === null) {
+      rafId = requestAnimationFrame(syncLiveClock)
+    } else if ((!playing || !enabled) && rafId !== null) {
+      cancelAnimationFrame(rafId)
+      rafId = null
+    }
+  },
+  { immediate: true }
+)
+
+interface LiveSeg {
+  text: string
+  pct: number
+  isSpace?: boolean
+}
+
+interface LiveRow {
+  idx: number
+  isActive: boolean
+  isSung: boolean
+  segs: LiveSeg[]
+}
+
+const liveTeleprompterRows = computed<LiveRow[]>(() => {
+  if (!projectStore.liveOverlayEnabled) return []
+  const rawLines = projectStore.currentProject?.lines || []
+  if (!rawLines.length) return []
+
+  const t = liveTime.value
+  const pageSize = projectStore.currentProject?.generation_params?.num_lines || 4
+
+  // Find active line or next upcoming line
+  let anchorIdx = rawLines.findIndex((ln: any[]) => {
+    if (!Array.isArray(ln) || !ln.length) return false
+    const s = Number(ln[0].start ?? 0)
+    const e = Number(ln[ln.length - 1].end ?? 0)
+    return t >= s - 0.15 && t <= e + 0.25
+  })
+  if (anchorIdx === -1) {
+    anchorIdx = rawLines.findIndex((ln: any[]) => Array.isArray(ln) && ln.length && Number(ln[0].start ?? 0) > t)
+    if (anchorIdx === -1) anchorIdx = Math.max(0, rawLines.length - 1)
+  }
+
+  const pageIdx = Math.floor(anchorIdx / pageSize)
+  const startIdx = pageIdx * pageSize
+  const slice = rawLines.slice(startIdx, startIdx + pageSize)
+
+  return slice.map((ln: any[], offset: number) => {
+    const idx = startIdx + offset
+    if (!Array.isArray(ln) || !ln.length) {
+      return { idx, isActive: false, isSung: false, segs: [] }
+    }
+    const ls = Number(ln[0].start ?? 0)
+    const le = Number(ln[ln.length - 1].end ?? 0)
+    const isActive = t >= ls - 0.12 && t <= le + 0.18
+    const isSung = t > le + 0.18
+
+    const segs: LiveSeg[] = []
+    ln.forEach((w: any, wIdx: number) => {
+      if (wIdx > 0) {
+        const prevEnd = Number(ln[wIdx - 1].end ?? 0)
+        segs.push({ text: ' ', pct: t >= prevEnd ? 100 : 0, isSpace: true })
+      }
+      const syls = Array.isArray(w.syllable_timings) && w.syllable_timings.length > 0 ? w.syllable_timings : null
+      if (syls) {
+        for (const st of syls) {
+          const ss = Number(st.start ?? w.start ?? 0)
+          const se = Number(st.end ?? w.end ?? ss + 0.1)
+          const dur = Math.max(0.01, se - ss)
+          const pct = t <= ss ? 0 : t >= se ? 100 : ((t - ss) / dur) * 100
+          segs.push({ text: String(st.text ?? ''), pct })
+        }
+      } else {
+        const ws = Number(w.start ?? 0)
+        const we = Number(w.end ?? ws + 0.1)
+        const dur = Math.max(0.01, we - ws)
+        const pct = t <= ws ? 0 : t >= we ? 100 : ((t - ws) / dur) * 100
+        segs.push({ text: String(w.text ?? ''), pct })
+      }
+    })
+
+    return { idx, isActive, isSung, segs }
+  })
+})
 
 const hasVideoFile = computed(() => {
   return Boolean(projectStore.currentProject?.has_video)
@@ -175,6 +279,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeyDown)
+  if (rafId !== null) {
+    cancelAnimationFrame(rafId)
+    rafId = null
+  }
 })
 </script>
 
@@ -238,6 +346,39 @@ onUnmounted(() => {
           </div>
         </div>
 
+        <!-- Live 60fps Karaoke Subtitle Overlay (previews edited timings without re-rendering MP4) -->
+        <div
+          v-if="projectStore.liveOverlayEnabled && liveTeleprompterRows.length > 0"
+          class="absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-slate-950 via-slate-950/95 to-slate-950/75 backdrop-blur-md border-t border-amber-400/30 px-6 py-3 flex flex-col items-center justify-end pointer-events-none"
+        >
+          <div class="mb-1.5 px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/40 text-[10px] font-semibold text-amber-300 tracking-wide">
+            ⚡ Живые титры (превью без пересборки MP4)
+          </div>
+          <div class="w-full flex flex-col items-center space-y-1 text-center">
+            <div
+              v-for="row in liveTeleprompterRows"
+              :key="row.idx"
+              :class="[
+                'font-bold leading-snug tracking-wide transition-opacity duration-150',
+                row.isActive ? 'text-lg sm:text-xl opacity-100 scale-[1.02]' : row.isSung ? 'text-sm sm:text-base opacity-45' : 'text-sm sm:text-base opacity-80'
+              ]"
+            >
+              <span
+                v-for="(seg, sIdx) in row.segs"
+                :key="sIdx"
+                class="relative inline-block whitespace-pre"
+              >
+                <span class="text-slate-100/90">{{ seg.text }}</span>
+                <span
+                  v-if="seg.pct > 0"
+                  class="absolute left-0 top-0 overflow-hidden whitespace-pre text-amber-400 drop-shadow-[0_0_8px_rgba(251,191,36,0.75)]"
+                  :style="{ width: `${seg.pct}%` }"
+                >{{ seg.text }}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+
         <!-- Synced dry vocal track -->
         <audio
           ref="audioRef"
@@ -295,6 +436,21 @@ onUnmounted(() => {
           <span class="text-studio-muted mx-1">/</span>
           <span class="text-slate-400">{{ formatTime(projectStore.duration) }}</span>
         </div>
+
+        <button
+          @click="projectStore.liveOverlayEnabled = !projectStore.liveOverlayEnabled"
+          :disabled="!projectStore.hasProject"
+          :class="[
+            'px-2.5 py-1 rounded text-xs font-medium border transition-colors flex items-center space-x-1 disabled:opacity-30',
+            projectStore.liveOverlayEnabled
+              ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+              : 'border-studio-border text-studio-muted hover:text-white hover:bg-studio-surface'
+          ]"
+          title="Показывать живые караоке-титры из текущих таймингов поверх видео без пересборки MP4"
+        >
+          <span>⚡</span>
+          <span>Живые титры</span>
+        </button>
       </div>
 
       <!-- Right: Audio Mix Controls -->

@@ -92,6 +92,17 @@ def test_allocate_syllable_durations():
         assert sum(durs) == dur, f"Sum {sum(durs)} != {dur} for {sylls}"
         assert all(d >= 1 for d in durs), f"Found non-positive duration in {durs}"
 
+    # Stretched ending words allocate extended musical hold to final syllable
+    stretched_cases = [
+        (["боль", "ша", "я"], 106),
+        (["по", "и", "гра", "ю"], 158),
+        (["му", "жи", "ком"], 165),
+    ]
+    for sylls, dur in stretched_cases:
+        durs = allocate_syllable_durations(sylls, dur)
+        assert sum(durs) == dur
+        assert durs[-1] > durs[0], f"Sustained hold was not allocated to final syllable in {sylls}: {durs}"
+
 
 def test_build_karaoke_line_tags_syllables():
     line_words = [

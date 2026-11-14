@@ -28,6 +28,33 @@ const scrollContainerRef = ref<HTMLDivElement | null>(null)
 const showFxModal = ref(false)
 const showEmojiModal = ref(false)
 const showManualModal = ref(false)
+const showPendingDropdown = ref(false)
+const isRealigningPending = ref(false)
+
+const pendingRows = computed(() => {
+  const lines = projectStore.currentProject?.lines || []
+  return projectStore.pendingRealignIndices
+    .filter((idx) => idx >= 0 && idx < lines.length && Array.isArray(lines[idx]) && lines[idx].length > 0)
+    .map((idx) => {
+      const ln = lines[idx]
+      const start = Number(ln[0]?.start ?? 0)
+      const end = Number(ln[ln.length - 1]?.end ?? 0)
+      const text = ln.map((w: any) => w.text || '').join(' ').trim()
+      return { idx, start, end, text }
+    })
+})
+
+async function handleRealignPending() {
+  if (isRealigningPending.value || projectStore.pendingRealignIndices.length === 0) return
+  isRealigningPending.value = true
+  try {
+    await projectStore.realignPendingLines()
+    showPendingDropdown.value = false
+    draw()
+  } finally {
+    isRealigningPending.value = false
+  }
+}
 
 function openManualModal() {
   if (playerStore.selStart === null || playerStore.selEnd === null) {
@@ -199,6 +226,31 @@ function drawPillBlock(
   }
 }
 
+function drawWaveformBars(
+  ctx: CanvasRenderingContext2D,
+  peaks: number[],
+  w: number,
+  yTop: number,
+  laneH: number,
+  fillStyle: string
+) {
+  if (!peaks.length) return
+  ctx.fillStyle = fillStyle
+  const pLen = peaks.length
+  const stepPx = 3
+  const barW = 2
+  const maxH = laneH - 10
+  for (let px = 0; px < w; px += stepPx) {
+    const pos = (px / w) * (pLen - 1)
+    const i0 = Math.floor(pos)
+    const i1 = Math.min(pLen - 1, i0 + 1)
+    const frac = pos - i0
+    const amp = peaks[i0] * (1 - frac) + peaks[i1] * frac
+    const ph = Math.max(1.5, amp * maxH)
+    ctx.fillRect(px, yTop + (laneH - ph) / 2, barW, ph)
+  }
+}
+
 function draw() {
   const canvas = canvasRef.value
   if (!canvas) return
@@ -280,39 +332,49 @@ function draw() {
   // 3. Track 1: Lyrics blocks (24..70)
   const yLyrics = 24
   const hLyrics = 46
+  const pendingSet = new Set(projectStore.pendingRealignIndices)
+  const rawLines = projectStore.currentProject?.lines || []
   lyricBlocks.value.forEach((b: any) => {
     const bx = timeToX(b.start, w)
     const bw = Math.max(6, timeToX(b.end, w) - bx)
+    const isPending = pendingSet.has(b.index)
+    const lineWords = Array.isArray(rawLines[b.index]) ? rawLines[b.index] : []
+
     drawPillBlock(
       ctx,
       bx,
       yLyrics + 6,
       bw,
       hLyrics - 12,
-      'rgba(14, 165, 233, 0.42)',
-      'rgba(2, 132, 199, 0.26)',
-      '#38bdf8',
-      b.text,
+      isPending ? 'rgba(245, 158, 11, 0.48)' : 'rgba(14, 165, 233, 0.42)',
+      isPending ? 'rgba(217, 119, 6, 0.28)' : 'rgba(2, 132, 199, 0.26)',
+      isPending ? '#fbbf24' : '#38bdf8',
+      isPending ? `🎙️ ${b.text}` : b.text,
       '#f0f9ff',
       `600 11px ${UI_FONT}`
     )
+
+    // Subtle bottom tick marks for word boundaries at >= 2x zoom without obscuring line text
+    if (bw >= 60 && lineWords.length > 1 && zoomFactor.value >= 2) {
+      ctx.strokeStyle = isPending ? 'rgba(251, 191, 36, 0.65)' : 'rgba(125, 211, 252, 0.55)'
+      ctx.lineWidth = 1
+      for (let wIdx = 1; wIdx < lineWords.length; wIdx++) {
+        const wsx = Math.round(timeToX(Number(lineWords[wIdx].start ?? b.start), w)) + 0.5
+        if (wsx > bx + 5 && wsx < bx + bw - 5) {
+          ctx.beginPath()
+          ctx.moveTo(wsx, yLyrics + hLyrics - 12)
+          ctx.lineTo(wsx, yLyrics + hLyrics - 7)
+          ctx.stroke()
+        }
+      }
+    }
   })
 
   // 4. Track 2: Vocal waveform & intervals (70..118)
   const yVoc = 70
   const hVoc = 48
   const vocPeaks = projectStore.currentProject?.vocal_peaks || []
-  if (vocPeaks.length > 0) {
-    ctx.fillStyle = 'rgba(16, 185, 129, 0.32)'
-    const pLen = vocPeaks.length
-    const barStride = w / pLen
-    const barW = Math.max(1, barStride * 0.72)
-    for (let i = 0; i < pLen; i++) {
-      const px = i * barStride
-      const ph = Math.max(1.5, vocPeaks[i] * (hVoc - 10))
-      ctx.fillRect(px, yVoc + (hVoc - ph) / 2, barW, ph)
-    }
-  }
+  drawWaveformBars(ctx, vocPeaks, w, yVoc, hVoc, 'rgba(16, 185, 129, 0.42)')
 
   const vocIntervals = projectStore.currentProject?.vocal_intervals || []
   vocIntervals.forEach((itv) => {
@@ -339,17 +401,7 @@ function draw() {
   const yInst = 118
   const hInst = 44
   const instPeaks = projectStore.currentProject?.inst_peaks || []
-  if (instPeaks.length > 0) {
-    ctx.fillStyle = 'rgba(245, 158, 11, 0.25)'
-    const pLen = instPeaks.length
-    const barStride = w / pLen
-    const barW = Math.max(1, barStride * 0.72)
-    for (let i = 0; i < pLen; i++) {
-      const px = i * barStride
-      const ph = Math.max(1.5, instPeaks[i] * (hInst - 10))
-      ctx.fillRect(px, yInst + (hInst - ph) / 2, barW, ph)
-    }
-  }
+  drawWaveformBars(ctx, instPeaks, w, yInst, hInst, 'rgba(245, 158, 11, 0.30)')
 
   const fxIntervals = projectStore.currentProject?.fx_intervals || []
   fxIntervals.forEach((itv) => {
@@ -884,6 +936,7 @@ watch(
     () => projectStore.currentProject,
     () => playerStore.selStart,
     () => playerStore.selEnd,
+    () => projectStore.pendingRealignIndices,
   ],
   () => {
     draw()
@@ -947,6 +1000,65 @@ onUnmounted(() => {
           <RefreshCw :class="['w-3.5 h-3.5', pipelineStore.isRebuilding ? 'animate-spin' : '']" />
           <span>Пересобрать видео</span>
         </button>
+
+        <!-- Pending vocal realign queue badge + dropdown -->
+        <div v-if="pendingRows.length > 0" class="relative">
+          <div class="inline-flex items-center rounded-md overflow-hidden border border-amber-400/50 shadow-sm">
+            <button
+              @click="handleRealignPending"
+              :disabled="isRealigningPending"
+              class="flex items-center space-x-1 px-2.5 py-1 bg-amber-500/25 hover:bg-amber-500/35 text-amber-200 font-semibold transition-colors disabled:opacity-50"
+              title="Пересчитать слова по вокалу внутри новых границ для изменённых строк"
+            >
+              <span>{{ isRealigningPending ? '⏳' : '🎙️' }}</span>
+              <span>Пересчитать ({{ pendingRows.length }})</span>
+            </button>
+            <button
+              @click="showPendingDropdown = !showPendingDropdown"
+              class="px-1.5 py-1 bg-amber-500/15 hover:bg-amber-500/30 text-amber-200 border-l border-amber-400/40"
+              title="Показать список строк на пересчёт и убрать лишние"
+            >
+              {{ showPendingDropdown ? '▲' : '▼' }}
+            </button>
+          </div>
+
+          <div
+            v-if="showPendingDropdown"
+            class="absolute bottom-9 left-0 z-40 w-80 bg-slate-900 border border-amber-400/40 rounded-lg shadow-2xl p-2 flex flex-col space-y-1.5"
+          >
+            <div class="flex items-center justify-between text-[11px] font-semibold text-amber-300 px-1">
+              <span>Строк на пересчёт: {{ pendingRows.length }}</span>
+              <button
+                @click="projectStore.clearPendingRealign(); showPendingDropdown = false"
+                class="text-[10px] text-slate-400 hover:text-rose-300 font-normal"
+              >
+                Очистить все
+              </button>
+            </div>
+            <div class="max-h-44 overflow-y-auto divide-y divide-slate-800">
+              <div
+                v-for="row in pendingRows"
+                :key="row.idx"
+                class="py-1 px-1 flex items-center gap-1.5 text-[11px] hover:bg-slate-800/70 rounded"
+              >
+                <button
+                  @click="playerStore.seek(row.start)"
+                  class="font-mono text-sky-400 shrink-0 hover:underline"
+                >
+                  {{ formatTime(row.start).slice(0, 5) }}–{{ formatTime(row.end).slice(0, 5) }}
+                </button>
+                <span class="truncate flex-1 text-slate-200" :title="row.text">{{ row.text }}</span>
+                <button
+                  @click="projectStore.removePendingRealign(row.idx)"
+                  class="px-1 text-slate-400 hover:text-rose-400 font-bold"
+                  title="Убрать эту строку из очереди на пересчёт"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
 
         <div class="h-4 w-px bg-studio-border mx-1"></div>
 

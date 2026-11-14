@@ -442,5 +442,64 @@ def test_pipeline_generate_existing_project(tmp_path, monkeypatch):
     assert args[5] is True  # use_ctc_align
 
 
+def test_timing_history_and_line_marks_endpoints(tmp_path):
+    import json
+    import shutil
+    from pathlib import Path
+
+    work_dir = Path("./output/work").resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    title = "_test_timing_history_api_"
+    state_file = work_dir / f"{title}_state.json"
+    hist_dir = work_dir / f"{title}_timings_history"
+
+    initial_state = {
+        "title": title,
+        "lines": [
+            [{"text": "Первая", "start": 1.0, "end": 1.5}, {"text": "строка", "start": 1.5, "end": 2.0}],
+            [{"text": "Вторая", "start": 2.5, "end": 3.0}, {"text": "строка", "start": 3.0, "end": 3.5}],
+        ],
+        "editor_text": "[00:01.00 -> 00:02.00] Первая строка\n[00:02.50 -> 00:03.50] Вторая строка",
+        "alignment_report": {"overall_score": 90.0},
+    }
+    state_file.write_text(json.dumps(initial_state, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        r_mark = client.post(f"/api/project/{title}/line-mark", json={"line_idx": 0, "mark": "good"})
+        assert r_mark.status_code == 200
+        assert r_mark.json()["line_mark_by_idx"]["0"] == "good"
+
+        r_opt = client.post(f"/api/project/{title}/optimize-timings")
+        assert r_opt.status_code == 200
+
+        r_hist = client.get(f"/api/project/{title}/timing-history")
+        assert r_hist.status_code == 200
+        snaps = r_hist.json()["snapshots"]
+        assert len(snaps) >= 1
+        snap_id = snaps[0]["id"]
+
+        r_diff = client.get(f"/api/project/{title}/timing-history/{snap_id}/diff")
+        assert r_diff.status_code == 200
+        assert len(r_diff.json()["diff"]) == 2
+
+        r_rest = client.post(f"/api/project/{title}/timing-history/{snap_id}/restore")
+        assert r_rest.status_code == 200
+        assert r_rest.json()["lines"][0][0]["start"] == 1.0
+
+        # Edit line 1 timing and call realign-changed-by-vocals with line_indices
+        r_voc = client.post(
+            f"/api/project/{title}/realign-changed-by-vocals",
+            json={
+                "editor_text": "[00:01.00 -> 00:02.00] Первая строка\n[00:02.30 -> 00:03.80] Вторая строка",
+            },
+        )
+        assert r_voc.status_code == 200
+        assert r_voc.json()["status"] == "ok"
+        assert r_voc.json()["lines"][1][0]["start"] == 2.30
+    finally:
+        state_file.unlink(missing_ok=True)
+        shutil.rmtree(hist_dir, ignore_errors=True)
+
+
 
 

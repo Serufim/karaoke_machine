@@ -53,7 +53,7 @@ def transcribe_vocals(
     language: Optional[str] = "ru",
     device: Optional[str] = None,
     initial_prompt: Optional[str] = None,
-    use_ctc_align: bool = False,
+    use_ctc_align: bool = True,
     condition_on_previous_text: bool = False,
     vad: Optional[str] = "auditok",
 ) -> Dict[str, Any]:
@@ -160,9 +160,9 @@ def transcribe_vocals(
     # Calibrate word timestamps with vocal energy envelope and anti-squash syllable balancing
     refined_segments = refine_word_timestamps(result, vocals_path=vocals_path)
 
-    # Optional Cyrillic Wav2Vec2 CTC character-level pass
-    if use_ctc_align and language.lower().startswith("ru"):
-        refined_segments = align_russian_ctc_on_segments(refined_segments, vocals_path, device="cpu")
+    # Multilingual / Cyrillic CTC character & syllable-level forced alignment pass
+    if use_ctc_align:
+        refined_segments = align_russian_ctc_on_segments(refined_segments, vocals_path)
 
     result["segments"] = refined_segments
     return result

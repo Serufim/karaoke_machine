@@ -62,6 +62,7 @@ export const usePipelineStore = defineStore('pipeline', () => {
         const projectStore = useProjectStore()
         projectStore.fetchProjects().then(async () => {
           await projectStore.loadProject(data.title!)
+          projectStore.liveOverlayEnabled = false
           projectStore.mediaTimestamp = Date.now()
         })
       }
@@ -73,6 +74,7 @@ export const usePipelineStore = defineStore('pipeline', () => {
         const projectStore = useProjectStore()
         projectStore.fetchProjects().then(async () => {
           await projectStore.loadProject(data.title!)
+          projectStore.liveOverlayEnabled = false
           projectStore.mediaTimestamp = Date.now()
         })
       }

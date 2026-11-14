@@ -214,3 +214,37 @@ def test_download_uses_its_own_mkv_and_never_unrelated_video(tmp_path, media, mo
     assert background.suffix == ".mkv"
     assert audio.is_file()
     assert unrelated.read_bytes() == b"another project"
+
+
+def test_analyze_and_transcribe_with_reference_lyrics(tmp_path, monkeypatch):
+    from karaoke import cli
+    audio = tmp_path / "song.wav"
+    audio.write_bytes(b"RIFF" + b"\x00" * 40)
+    output = tmp_path / "project"
+
+    monkeypatch.setattr(cli, "get_audio_from_source", lambda *args, **kwargs: (audio, "song", None, None))
+    monkeypatch.setattr(cli, "ensure_project_cover", lambda *args: None)
+    monkeypatch.setattr(cli, "separate_stems", lambda **kwargs: (audio, audio))
+    monkeypatch.setattr(cli, "transcribe_vocals", lambda **kwargs: {
+        "segments": [{"words": [{"text": "тест", "start": 1.0, "end": 2.0}]}]
+    })
+    monkeypatch.setattr(cli, "detect_chorus_fx_intervals", lambda *args: [])
+    monkeypatch.setattr(cli, "compute_waveform_peaks", lambda *args: ([0.1] * 10, 2.0))
+
+    passed_model = None
+    def mock_refine(raw_words, reference_lyrics, vocals_path, whisper_model, work_dir):
+        nonlocal passed_model
+        passed_model = whisper_model
+        return raw_words
+
+    monkeypatch.setattr(cli, "refine_unaligned_vocal_slices", mock_refine)
+
+    state = cli.analyze_and_transcribe(
+        str(audio),
+        output,
+        model_size="bond005/whisper-podlodka-turbo",
+        reference_lyrics="тест эталона",
+    )
+    assert passed_model == "bond005/whisper-podlodka-turbo"
+    assert "editor_text" in state
+

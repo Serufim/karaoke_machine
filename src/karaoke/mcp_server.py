@@ -492,6 +492,372 @@ def get_hardware_profile() -> Dict[str, Any]:
     return get_hardware_profile_dict()
 
 
+# ---------------------------------------------------------------------------
+# Fine-grained timing tools (inspect / move / re-align individual lines)
+# ---------------------------------------------------------------------------
+
+
+def _load_state(title: str) -> Dict[str, Any]:
+    state_file = WORK_DIR / f"{title}_state.json"
+    if not state_file.exists():
+        raise FileNotFoundError(f"Проект '{title}' не найден.")
+    return json.loads(state_file.read_text(encoding="utf-8"))
+
+
+def _save_state(title: str, state_data: Dict[str, Any], snapshot_reason: Optional[str], prev_state: Optional[Dict[str, Any]] = None) -> None:
+    from karaoke import timing_history
+
+    if snapshot_reason and prev_state is not None:
+        timing_history.save_snapshot(WORK_DIR, title, prev_state, reason=snapshot_reason)
+    lines = state_data.get("lines") or []
+    validate_karaoke_lines(lines)
+    state_data["editor_text"] = lines_to_editor_text(lines)
+    state_data["line_marks"] = timing_history.refresh_mark_timings(lines, state_data.get("line_marks"))
+    try:
+        from karaoke.alignment_qa import evaluate_alignment_quality
+
+        vocals = Path(state_data["vocals_wav"]) if state_data.get("vocals_wav") else None
+        state_data["alignment_report"] = evaluate_alignment_quality(lines, vocals)
+    except Exception:
+        pass
+    (WORK_DIR / f"{title}_state.json").write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _fmt_line(idx: int, line: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "index": idx,
+        "start": round(float(line[0]["start"]), 2) if line else None,
+        "end": round(float(line[-1]["end"]), 2) if line else None,
+        "text": " ".join(str(w.get("text", "")) for w in line),
+        "words": [
+            {
+                "text": w.get("text"),
+                "start": round(float(w["start"]), 2),
+                "end": round(float(w["end"]), 2),
+                **(
+                    {"syllables": [
+                        {"text": t.get("text"), "start": round(float(t["start"]), 2), "end": round(float(t["end"]), 2)}
+                        for t in w.get("syllable_timings", [])
+                    ]}
+                    if w.get("syllable_timings") else {}
+                ),
+            }
+            for w in line
+        ],
+    }
+
+
+@server.tool()
+def get_lines(title: str, start_time: float = 0.0, end_time: float = 1e9) -> Dict[str, Any]:
+    """Return word-level (and syllable-level) timings of lines overlapping [start_time, end_time], plus raw Whisper words there.
+
+    Args:
+        title: Project title.
+        start_time: Window start in seconds.
+        end_time: Window end in seconds.
+    """
+    try:
+        s = _load_state(title)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    lines = s.get("lines") or []
+    picked = [
+        _fmt_line(i, ln) for i, ln in enumerate(lines)
+        if ln and float(ln[-1]["end"]) >= start_time and float(ln[0]["start"]) <= end_time
+    ]
+    whisper = [
+        {"text": w.get("text"), "start": round(float(w["start"]), 2), "end": round(float(w["end"]), 2)}
+        for w in (s.get("recognized_words") or [])
+        if float(w.get("end", 0)) >= start_time and float(w.get("start", 0)) <= end_time
+    ]
+    return {"status": "success", "lines": picked, "whisper_words": whisper}
+
+
+@server.tool()
+def analyze_vocal_window(title: str, start_time: float, end_time: float, step: float = 0.05) -> Dict[str, Any]:
+    """Return the isolated-vocal loudness profile in a window: pauses (silence gaps) and strong syllable onsets.
+
+    Use it to see where phrases really start/end before moving lines.
+
+    Args:
+        title: Project title.
+        start_time: Window start in seconds.
+        end_time: Window end in seconds.
+        step: Analysis frame in seconds (default 0.05).
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        s = _load_state(title)
+        audio, sr = sf.read(s["vocals_wav"])
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        times = np.arange(max(0.0, start_time), end_time, step)
+        rms = np.array([
+            float(np.sqrt(np.mean(audio[int(t * sr):int((t + step) * sr)] ** 2))) if int((t + step) * sr) > int(t * sr) else 0.0
+            for t in times
+        ])
+        if not len(rms):
+            return {"status": "error", "error": "Пустое окно"}
+        peak = float(rms.max()) or 1.0
+        norm = rms / peak
+        silent = norm < 0.12
+        pauses = []
+        k = 0
+        while k < len(silent):
+            if silent[k]:
+                j = k
+                while j < len(silent) and silent[j]:
+                    j += 1
+                if (j - k) * step >= 0.12:
+                    pauses.append({"start": round(float(times[k]), 2), "end": round(float(times[min(j, len(times) - 1)]), 2)})
+                k = j
+            else:
+                k += 1
+        onsets = [
+            round(float(times[i]), 2)
+            for i in range(1, len(norm))
+            if norm[i] - norm[i - 1] > 0.25 and norm[i] > 0.4
+        ]
+        chars = " .:|#"
+        profile = "".join(chars[min(4, int(v * 5))] for v in norm)
+        return {
+            "status": "success",
+            "step": step,
+            "profile": profile,
+            "pauses": pauses,
+            "onsets": onsets,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@server.tool()
+def set_line_timing(title: str, line_index: int, new_start: float, new_end: float, realign_by_vocals: bool = True) -> Dict[str, Any]:
+    """Move/stretch one line to [new_start, new_end] (neighbours are trimmed if they overlap), then optionally
+    re-align its words and syllables to the vocal inside that window (MMS_FA CTC).
+
+    Args:
+        title: Project title.
+        line_index: 0-based line index.
+        new_start: New line start (seconds).
+        new_end: New line end (seconds).
+        realign_by_vocals: Re-run vocal alignment of words inside the new window (default True).
+    """
+    import copy
+
+    from karaoke.aligner import realign_lines_by_vocals
+
+    try:
+        s = _load_state(title)
+        prev = copy.deepcopy(s)
+        lines = s.get("lines") or []
+        if not (0 <= line_index < len(lines)) or not lines[line_index]:
+            return {"status": "error", "error": f"Неверный индекс строки {line_index}"}
+        new_start = round(max(0.0, new_start), 2)
+        new_end = round(max(new_start + 0.15, new_end), 2)
+        line = lines[line_index]
+        o_s, o_e = float(line[0]["start"]), float(line[-1]["end"])
+        span = max(0.01, o_e - o_s)
+        k = (new_end - new_start) / span
+        for w in line:
+            w["start"] = round(new_start + (float(w["start"]) - o_s) * k, 2)
+            w["end"] = round(new_start + (float(w["end"]) - o_s) * k, 2)
+            w.pop("syllable_timings", None)
+        _trim_neighbours(lines, line_index)
+        if realign_by_vocals and s.get("vocals_wav"):
+            lines, _ = realign_lines_by_vocals(lines, Path(s["vocals_wav"]), [line_index])
+        s["lines"] = lines
+        _save_state(title, s, "manual", prev)
+        notify_studio_ui("project_updated", title, f"Строка {line_index} перенесена через MCP", "timing_shifted")
+        return {"status": "success", "line": _fmt_line(line_index, lines[line_index])}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def _trim_neighbours(lines: List[List[Dict[str, Any]]], idx: int) -> None:
+    """Trims previous/next lines so they never overlap line `idx` (keeps min 0.08s per word)."""
+    cur = lines[idx]
+    c_s, c_e = float(cur[0]["start"]), float(cur[-1]["end"])
+    if idx > 0 and lines[idx - 1]:
+        prev = lines[idx - 1]
+        if float(prev[-1]["end"]) > c_s:
+            _compress_line_into(prev, float(prev[0]["start"]), c_s)
+    if idx + 1 < len(lines) and lines[idx + 1]:
+        nxt = lines[idx + 1]
+        if float(nxt[0]["start"]) < c_e:
+            _compress_line_into(nxt, c_e, max(c_e + 0.08 * len(nxt), float(nxt[-1]["end"])))
+
+
+def _compress_line_into(line: List[Dict[str, Any]], new_s: float, new_e: float) -> None:
+    o_s, o_e = float(line[0]["start"]), float(line[-1]["end"])
+    span = max(0.01, o_e - o_s)
+    new_e = max(new_e, new_s + 0.08 * len(line))
+    k = (new_e - new_s) / span
+    for w in line:
+        w["start"] = round(new_s + (float(w["start"]) - o_s) * k, 2)
+        w["end"] = round(new_s + (float(w["end"]) - o_s) * k, 2)
+        w.pop("syllable_timings", None)
+
+
+@server.tool()
+def set_word_timings(title: str, line_index: int, words: List[Dict[str, float]]) -> Dict[str, Any]:
+    """Set exact start/end for every word of one line (precise manual fix).
+
+    Args:
+        title: Project title.
+        line_index: 0-based line index.
+        words: List of {"start": float, "end": float} — one entry per word of the line, in order.
+    """
+    import copy
+
+    from karaoke.aligner import compute_vocal_rms_envelope, estimate_acoustic_syllable_timings
+
+    try:
+        s = _load_state(title)
+        prev = copy.deepcopy(s)
+        lines = s.get("lines") or []
+        if not (0 <= line_index < len(lines)):
+            return {"status": "error", "error": f"Неверный индекс строки {line_index}"}
+        line = lines[line_index]
+        if len(words) != len(line):
+            return {"status": "error", "error": f"В строке {len(line)} слов, передано {len(words)}"}
+        rms, hop = compute_vocal_rms_envelope(Path(s["vocals_wav"])) if s.get("vocals_wav") else (None, 0.01)
+        for w, t in zip(line, words):
+            w["start"] = round(float(t["start"]), 2)
+            w["end"] = round(float(t["end"]), 2)
+            w.pop("syllable_timings", None)
+            explicit_syl = t.get("syllables") or t.get("syllable_timings")
+            if explicit_syl:
+                w["syllable_timings"] = [
+                    {
+                        "text": str(s.get("text", "")),
+                        "start": round(float(s["start"]), 3),
+                        "end": round(float(s["end"]), 3),
+                    }
+                    for s in explicit_syl
+                ]
+            elif rms is not None and len(rms):
+                st = estimate_acoustic_syllable_timings(w["text"], w["start"], w["end"], rms, hop)
+                if len(st) > 1:
+                    w["syllable_timings"] = st
+        _trim_neighbours(lines, line_index)
+        s["lines"] = lines
+        _save_state(title, s, "manual", prev)
+        notify_studio_ui("project_updated", title, f"Слова строки {line_index} обновлены через MCP", "timing_shifted")
+        return {"status": "success", "line": _fmt_line(line_index, lines[line_index])}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@server.tool()
+def shift_lines(title: str, from_index: int, to_index: int, delta_seconds: float) -> Dict[str, Any]:
+    """Shift a block of consecutive lines [from_index..to_index] by delta_seconds (keeps internal word timings).
+
+    Args:
+        title: Project title.
+        from_index: First line index (inclusive).
+        to_index: Last line index (inclusive).
+        delta_seconds: Positive = later, negative = earlier.
+    """
+    import copy
+
+    try:
+        s = _load_state(title)
+        prev = copy.deepcopy(s)
+        lines = s.get("lines") or []
+        if not (0 <= from_index <= to_index < len(lines)):
+            return {"status": "error", "error": "Неверный диапазон строк"}
+        for i in range(from_index, to_index + 1):
+            for w in lines[i]:
+                w["start"] = round(max(0.0, float(w["start"]) + delta_seconds), 2)
+                w["end"] = round(max(0.0, float(w["end"]) + delta_seconds), 2)
+                for t in w.get("syllable_timings", []) or []:
+                    t["start"] = round(float(t["start"]) + delta_seconds, 3)
+                    t["end"] = round(float(t["end"]) + delta_seconds, 3)
+        _trim_neighbours(lines, from_index)
+        _trim_neighbours(lines, to_index)
+        s["lines"] = lines
+        _save_state(title, s, "manual", prev)
+        notify_studio_ui("project_updated", title, "Блок строк сдвинут через MCP", "timing_shifted")
+        return {"status": "success", "lines": [_fmt_line(i, lines[i]) for i in range(from_index, to_index + 1)]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@server.tool()
+def realign_lines(title: str, line_indices: List[int], mode: str = "vocals") -> Dict[str, Any]:
+    """Re-generate timings of specific lines.
+
+    Args:
+        title: Project title.
+        line_indices: 0-based line indices to re-align.
+        mode: 'vocals' = MMS_FA CTC forced alignment of words/syllables inside each line's current window;
+              'whisper' = restore raw Whisper word timings for those lines (if every word can be matched).
+    """
+    import copy
+
+    from karaoke.aligner import compute_vocal_rms_envelope, realign_lines_by_vocals
+    from karaoke.alignment_qa import _refresh_word_syllable_timings, whisper_line_candidate
+
+    try:
+        s = _load_state(title)
+        prev = copy.deepcopy(s)
+        lines = s.get("lines") or []
+        vocals = Path(s["vocals_wav"]) if s.get("vocals_wav") else None
+        updated: List[int] = []
+        if mode == "whisper":
+            rms, hop = compute_vocal_rms_envelope(vocals)
+            for idx in line_indices:
+                if not (0 <= idx < len(lines)):
+                    continue
+                cand = whisper_line_candidate(lines[idx], s.get("recognized_words"))
+                if cand:
+                    for w in cand:
+                        _refresh_word_syllable_timings(w, rms, hop)
+                    lines[idx] = cand
+                    _trim_neighbours(lines, idx)
+                    updated.append(idx)
+        else:
+            lines, updated = realign_lines_by_vocals(lines, vocals, line_indices)
+        s["lines"] = lines
+        _save_state(title, s, "realign_vocals" if mode != "whisper" else "manual", prev)
+        notify_studio_ui("project_updated", title, f"Пересчитано строк: {len(updated)}", "timing_shifted")
+        return {"status": "success", "updated": updated, "lines": [_fmt_line(i, lines[i]) for i in updated]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@server.tool()
+def list_timing_history(title: str) -> Dict[str, Any]:
+    """List saved timing snapshots (versions) of a project, newest first."""
+    from karaoke import timing_history
+
+    return {"status": "success", "snapshots": timing_history.list_snapshots(WORK_DIR, title)}
+
+
+@server.tool()
+def restore_timing_snapshot(title: str, snapshot_id: str) -> Dict[str, Any]:
+    """Restore project timings from a snapshot id (current version is saved to history first)."""
+    import copy
+
+    from karaoke import timing_history
+
+    try:
+        s = _load_state(title)
+        snap = timing_history.load_snapshot(WORK_DIR, title, snapshot_id)
+        if not snap:
+            return {"status": "error", "error": "Версия не найдена"}
+        prev = copy.deepcopy(s)
+        s["lines"] = snap["lines"]
+        _save_state(title, s, "restore", prev)
+        notify_studio_ui("project_updated", title, "Версия таймингов восстановлена через MCP", "timing_shifted")
+        return {"status": "success", "lines_count": len(s["lines"])}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 @server.tool()
 def get_models_catalog() -> Dict[str, Any]:
     """Get status of installed and available Whisper and Demucs AI models with disk sizes."""

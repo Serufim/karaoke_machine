@@ -16,6 +16,13 @@ This skill guides Antigravity agents in controlling AI Karaoke Studio via its na
 * **`generate_karaoke`**: Fully autonomous end-to-end karaoke creation from a local audio file or YouTube URL:
   * Arguments: `media_path` (required), `reference_lyrics` (optional text), `whisper_model`, `demucs_model`, `use_ctc_align`, `vad_filter`, `bg_mode`.
 * **`regenerate_project`**: Re-runs transcription or alignment with altered model settings while reusing Demucs stem cache.
+* **`get_lines`**: Returns word-level and syllable-level timings of lines overlapping `[start_time, end_time]`, plus raw Whisper words in that window.
+* **`analyze_vocal_window`**: Returns the isolated-vocal loudness profile (` .:|#`), detected pauses, and syllable onsets in `[start_time, end_time]`.
+* **`set_line_timing`**: Moves/stretches one line to `[new_start, new_end]` (trimming neighbours on overlap) and optionally re-aligns its words/syllables to the vocal (`realign_by_vocals=True`).
+* **`set_word_timings`**: Sets exact `start`/`end` (and optional `syllables`) for every word of a single line.
+* **`shift_lines`**: Shifts a range of consecutive lines `[from_index..to_index]` by `delta_seconds` while preserving internal word & syllable intervals.
+* **`realign_lines`**: Re-generates timings of specific lines (`line_indices`) using `mode="vocals"` (MMS_FA CTC forced alignment on vocals) or `mode="whisper"` (raw Whisper word anchors).
+* **`list_timing_history`** / **`restore_timing_snapshot`**: Lists or restores saved timing snapshots (`output/work/<title>_history/`).
 * **`shift_line_timing`**: Shifts start/end time of a specific line by `shift_seconds` (positive or negative).
 * **`update_project_lyrics`**: Updates line text or timing directly in `karaoke_state.json`.
 * **`rebuild_video`**: Re-renders ASS subtitles and Full HD MP4 video with updated timings or visual styles (`cyberpunk`, `gold_neon`, `silver`, `cover_blur`).

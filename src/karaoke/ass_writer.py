@@ -4,7 +4,14 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import soundfile as sf
-from karaoke.aligner import clean_word_token, split_into_karaoke_lines, validate_karaoke_lines
+from karaoke.aligner import (
+    RU_SPECIAL_SIGNS,
+    RU_VOWELS,
+    clean_word_token,
+    split_into_karaoke_lines,
+    split_word_into_syllables,
+    validate_karaoke_lines,
+)
 from karaoke.emoji_layer import split_text_emoji, ass_placeholder, layout_line_emoji
 
 # All teleprompter styles use opaque text/outline and a 50% shadow (BackColour &H80......)
@@ -66,116 +73,12 @@ def _karaoke_scale(line_words: List[Dict[str, Any]]) -> int:
     return 100
 
 
-RU_VOWELS = set("аеёиоуыэюяАЕЁИОУЫЭЮЯ")
-RU_SPECIAL_SIGNS = set("ьъЬЪ")
-
-
-def split_word_into_syllables(word: str) -> List[str]:
-    """
-    Splits a Russian or multilingual word into phonetic/musical syllables for karaoke highlighting.
-    Preserves all leading/trailing punctuation, hyphens, and characters exactly (sum of parts == word).
-    """
-    if not word or len(word) <= 2:
-        return [word]
-
-    has_cyrillic = bool(re.search(r"[а-яёА-ЯЁ]", word))
-    if not has_cyrillic:
-        # Latin / English syllabification
-        cleaned = re.sub(r"[^a-zA-Z]", "", word).lower()
-        if not cleaned:
-            return [word]
-        v_groups = list(re.finditer(r"[aeiouy]+", word, re.IGNORECASE))
-        if not v_groups:
-            return [word]
-        # Drop silent 'e' at end when multiple vowel groups (e.g. bounce, house, make)
-        if len(v_groups) > 1 and word.lower().rstrip(".,!?;:\"'").endswith("e"):
-            stem = word.lower().rstrip(".,!?;:\"'")
-            if not (len(stem) >= 3 and stem.endswith("le") and stem[-3] not in "aeiouy"):
-                if v_groups[-1].group().lower() == "e" and v_groups[-1].end() == len(stem):
-                    v_groups = v_groups[:-1]
-        if len(v_groups) <= 1:
-            return [word]
-
-        split_indices = []
-        for k in range(len(v_groups) - 1):
-            end_v1 = v_groups[k].end()
-            start_v2 = v_groups[k + 1].start()
-            between = list(range(end_v1, start_v2))
-            if not between:
-                split_indices.append(start_v2)
-            elif len(between) == 1:
-                split_indices.append(between[0])
-            else:
-                mid = end_v1 + (len(between) // 2)
-                split_indices.append(mid)
-
-        sylls = []
-        prev = 0
-        for idx in split_indices:
-            sylls.append(word[prev:idx])
-            prev = idx
-        sylls.append(word[prev:])
-        return sylls
-
-    # Russian / Cyrillic syllabification
-    vowel_indices = [i for i, ch in enumerate(word) if ch in RU_VOWELS]
-    if len(vowel_indices) <= 1:
-        return [word]
-
-    split_indices = []
-    for k in range(len(vowel_indices) - 1):
-        v1 = vowel_indices[k]
-        v2 = vowel_indices[k + 1]
-        consonants = list(range(v1 + 1, v2))
-        if not consonants:
-            # Adjacent vowels: split between them (по-пол-ня-ет, де-ла-ют)
-            split_indices.append(v2)
-            continue
-
-        sign_idx = next((c for c in consonants if word[c] in RU_SPECIAL_SIGNS), None)
-        if sign_idx is not None:
-            # ь/ъ always ends the preceding syllable (сись-ки, подъ-езд, маль-чик)
-            split_indices.append(sign_idx + 1)
-            continue
-
-        y_idx = next((c for c in consonants if word[c] in "йЙ"), None)
-        if y_idx is not None:
-            # й always ends the preceding syllable (май-ка, ай-фон, пой-мать)
-            split_indices.append(y_idx + 1)
-            continue
-
-        if len(consonants) == 1:
-            # Single consonant: open syllable rule (ма-ма, ба-ланс)
-            split_indices.append(consonants[0])
-        elif len(consonants) == 2:
-            c0, c1 = consonants[0], consonants[1]
-            ch0, ch1 = word[c0].lower(), word[c1].lower()
-            if ch0 == ch1 or ch0 in "рлмн":
-                # Geminates (ван-на) or sonorant + obstruent (пол-ня, пар-та)
-                split_indices.append(c1)
-            else:
-                # Obstruent cluster belongs to opening of next syllable (се-стра, про-сто)
-                split_indices.append(c0)
-        else:
-            c0 = consonants[0]
-            ch0 = word[c0].lower()
-            if ch0 in "рлмн":
-                split_indices.append(consonants[1])
-            else:
-                split_indices.append(c0)
-
-    sylls = []
-    prev = 0
-    for idx in split_indices:
-        sylls.append(word[prev:idx])
-        prev = idx
-    sylls.append(word[prev:])
-    return sylls
-
-
 def allocate_syllable_durations(syllables: List[str], duration_cs: int) -> List[int]:
     """
-    Distributes word duration (in centiseconds) across syllables proportionally to alphanumeric weight.
+    Distributes word duration (in centiseconds) across syllables for karaoke highlighting (\\kf).
+    - For normal-tempo words, allocates durations proportionally to phonetic/syllable weight.
+    - For extended/stretched singing words (e.g. held note on ending word), non-final syllables
+      sing at natural tempo (~14-26 cs) while the final/sustained syllable carries the musical hold.
     Guarantees sum(durations) == duration_cs down to 1 centisecond.
     """
     n = len(syllables)
@@ -183,24 +86,35 @@ def allocate_syllable_durations(syllables: List[str], duration_cs: int) -> List[
         return [duration_cs]
 
     min_cs = max(1, min(4, duration_cs // n))
-    weights = [max(1, len([c for c in s if c.isalnum()])) for s in syllables]
-    total_w = sum(weights)
-    durs = [max(min_cs, int(round(duration_cs * (w / total_w)))) for w in weights]
-    diff = duration_cs - sum(durs)
 
-    if diff != 0:
-        order = sorted(range(n), key=lambda i: durs[i], reverse=(diff > 0))
-        step = 1 if diff > 0 else -1
-        idx = 0
-        while diff != 0:
-            target_i = order[idx % n]
-            if step > 0 or durs[target_i] > min_cs:
-                durs[target_i] += step
-                diff -= step
-            idx += 1
-            if idx > n * 10:
-                durs[order[0]] += diff
-                break
+    def _base_cs(s: str) -> int:
+        consonants = len([c for c in s if c.isalnum() and c not in RU_VOWELS and c.lower() not in "aeiouy"])
+        return max(12, min(30, 14 + consonants * 4))
+
+    prefix_base = [_base_cs(s) for s in syllables[:-1]]
+    min_prefix = sum(prefix_base)
+
+    if duration_cs > min_prefix + 20:
+        durs = list(prefix_base) + [duration_cs - min_prefix]
+    else:
+        weights = [max(1, len([c for c in s if c.isalnum()])) for s in syllables]
+        total_w = sum(weights)
+        durs = [max(min_cs, int(round(duration_cs * (w / total_w)))) for w in weights]
+        diff = duration_cs - sum(durs)
+
+        if diff != 0:
+            order = sorted(range(n), key=lambda i: durs[i], reverse=(diff > 0))
+            step = 1 if diff > 0 else -1
+            idx = 0
+            while diff != 0:
+                target_i = order[idx % n]
+                if step > 0 or durs[target_i] > min_cs:
+                    durs[target_i] += step
+                    diff -= step
+                idx += 1
+                if idx > n * 10:
+                    durs[order[0]] += diff
+                    break
 
     return durs
 
@@ -208,12 +122,14 @@ def allocate_syllable_durations(syllables: List[str], duration_cs: int) -> List[
 def build_karaoke_line_tags(
     line_words: List[Dict[str, Any]],
     display_start: float,
+    display_end: Optional[float] = None,
     font_size: float = 54,
 ) -> str:
     """
     Builds the ASS {\\k} and {\\kf} tagged string for the active karaoke line.
     Automatically scales down font width if the line is very long (> 40 chars) so it never wraps.
     Highlights multi-syllable words syllable-by-syllable (\\kf) for natural musical cadence.
+    If display_end is provided, ensures the final syllable's highlight finishes cleanly before line exit.
     """
     line_start = line_words[0]["start"]
     lead_in_gap = max(0.0, line_start - display_start)
@@ -229,12 +145,18 @@ def build_karaoke_line_tags(
         k_text += f"{{\\k{lead_in_cs}}}"
 
     prev_word_end = line_start
-    for word_info in line_words:
+    n_words = len(line_words)
+    for idx, word_info in enumerate(line_words):
         word_str = clean_word_token(word_info.get("text", ""))
         if not word_str:
             continue
         w_start = max(prev_word_end, float(word_info.get("start", prev_word_end)))
         w_end = max(w_start + 0.08, float(word_info.get("end", w_start + 0.25)))
+
+        if display_end is not None and idx == n_words - 1:
+            # Prevent final syllable from dragging into or past the transition point
+            max_allowed = max(w_start + 0.08, display_end - 0.04)
+            w_end = min(w_end, max_allowed)
 
         inter_word_gap = max(0.0, w_start - prev_word_end)
         if inter_word_gap > 0.02:
@@ -243,14 +165,40 @@ def build_karaoke_line_tags(
 
         duration_cs = max(8, int(round((w_end - w_start) * 100)))
 
-        sylls = split_word_into_syllables(word_str)
-        if len(sylls) <= 1:
-            k_text += f"{{\\kf{duration_cs}}}{_ass_text_with_emoji(word_str, font_size)} "
-        else:
-            syll_durs = allocate_syllable_durations(sylls, duration_cs)
+        raw_syl_timings = word_info.get("syllable_timings")
+        if (
+            isinstance(raw_syl_timings, list)
+            and len(raw_syl_timings) > 1
+            and "".join(str(s.get("text", "")) for s in raw_syl_timings) == word_str
+        ):
+            sylls = [str(s["text"]) for s in raw_syl_timings]
+            raw_durs = [max(0.01, float(s["end"]) - float(s["start"])) for s in raw_syl_timings]
+            tot_raw = max(1e-6, sum(raw_durs))
+            min_cs = max(1, min(4, duration_cs // len(sylls)))
+            syll_durs = [max(min_cs, int(round(duration_cs * (d / tot_raw)))) for d in raw_durs]
+            diff = duration_cs - sum(syll_durs)
+            if diff != 0:
+                order = sorted(range(len(sylls)), key=lambda i: syll_durs[i], reverse=(diff < 0))
+                step = 1 if diff > 0 else -1
+                k_idx = 0
+                while diff != 0 and k_idx < len(sylls) * 10:
+                    ti = order[k_idx % len(sylls)]
+                    if step > 0 or syll_durs[ti] > min_cs:
+                        syll_durs[ti] += step
+                        diff -= step
+                    k_idx += 1
             for s_dur, s_txt in zip(syll_durs, sylls):
                 k_text += f"{{\\kf{s_dur}}}{_ass_text_with_emoji(s_txt, font_size)}"
             k_text += " "
+        else:
+            sylls = split_word_into_syllables(word_str)
+            if len(sylls) <= 1:
+                k_text += f"{{\\kf{duration_cs}}}{_ass_text_with_emoji(word_str, font_size)} "
+            else:
+                syll_durs = allocate_syllable_durations(sylls, duration_cs)
+                for s_dur, s_txt in zip(syll_durs, sylls):
+                    k_text += f"{{\\kf{s_dur}}}{_ass_text_with_emoji(s_txt, font_size)}"
+                k_text += " "
 
         prev_word_end = w_end
 
@@ -880,7 +828,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
         if current_stanza:
             gap = line[0]["start"] - current_stanza[-1][-1]["end"]
-            if gap > 4.0:
+            if gap > 3.0:
                 stanzas.append(current_stanza)
                 current_stanza = []
         current_stanza.append(line)
@@ -923,24 +871,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for i in range(n_lines - 1):
             e_curr = stanza[i][-1]["end"]
             s_next = stanza[i + 1][0]["start"]
-            if s_next <= e_curr:
+            if s_next <= e_curr + 0.02:
+                # Tight transition: switch at s_next so next line is never late
                 roll_t = s_next
             else:
                 gap = s_next - e_curr
-                hold = min(0.35, max(0.08, gap / 2.0))
-                roll_t = min(e_curr + hold, s_next - 0.05)
-                roll_t = max(e_curr + 0.05, roll_t)
+                hold = min(0.18, gap * 0.30)
+                roll_t = min(e_curr + hold, s_next - 0.02)
             step_end[i] = roll_t
             step_start[i + 1] = roll_t
 
-        last_hold = min(1.6, max(0.8, (next_stanza_start - stanza_last_end - 0.5) if next_stanza_start else 1.8))
+        if next_stanza_start is not None:
+            avail_after = max(0.08, next_stanza_start - stanza_last_end - 0.35)
+            last_hold = min(1.4, avail_after)
+        else:
+            last_hold = 1.6
         step_end[-1] = stanza_last_end + last_hold
 
         # Teleprompter rows (Layer 1)
         def _emit(style: str, layer: int, t_s: float, t_e: float, line_words, karaoke: bool):
             fs, bold, mv = style_meta[style]
             if karaoke:
-                text_tags = build_karaoke_line_tags(line_words, t_s, font_size=fs)
+                text_tags = build_karaoke_line_tags(line_words, t_s, display_end=t_e, font_size=fs)
                 plain, _ = _plain_text_and_scale(line_words)
                 scale = _karaoke_scale(line_words)
             else:

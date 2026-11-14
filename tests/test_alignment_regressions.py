@@ -626,6 +626,152 @@ def test_refine_unaligned_vocal_slices_synthetic():
     assert res == raw_words
 
 
+def test_omitted_outro_vocal_repetitions_do_not_hijack_line_timing():
+    """
+    Verifies that when vocals have trailing repetitions / ad-libs in the outro
+    (e.g., 'умею целоваться' followed by repeated 'целоваться' in outro audio),
+    and the reference lyrics omit those outro repetitions, the aligner binds
+    the line's last word to the first acoustic occurrence immediately following
+    the preceding words, rather than jumping to trailing repetitions and squashing
+    the word duration.
+    """
+    recognized = [
+        {"text": "умею", "start": 217.90, "end": 218.56},
+        {"text": "целоваться", "start": 218.56, "end": 219.82},
+        # Trailing outro vocal ad-libs not present in lyrics
+        {"text": "Целоваться", "start": 221.00, "end": 222.50},
+        {"text": "Целоваться", "start": 225.00, "end": 226.50},
+        {"text": "Целоваться", "start": 230.94, "end": 232.98},
+    ]
+    reference = [
+        "Я в классе лучше всех умею целоваться"
+    ]
+    # Recognizer before "умею"
+    prefix = [
+        {"text": "Я", "start": 216.46, "end": 216.64},
+        {"text": "в", "start": 216.64, "end": 216.78},
+        {"text": "классе", "start": 216.78, "end": 217.24},
+        {"text": "лучше", "start": 217.24, "end": 217.64},
+        {"text": "всех", "start": 217.64, "end": 217.90},
+    ]
+    full_recognized = prefix + recognized
+    aligned = align_words_to_reference_lines(full_recognized, reference)
+    validate_karaoke_lines(aligned)
+
+    last_line = aligned[0]
+    last_word = last_line[-1]
+    assert last_word["text"] == "целоваться"
+    # Must bind to the first occurrence at 218.56..219.82, not the outro jump at 230s+
+    assert last_word["start"] == 218.56
+    assert last_word["end"] == 219.82
+
+
+def _parse_ass_time_seconds(ts: str) -> float:
+    h, m, s = ts.strip().split(":")
+    return int(h) * 3600.0 + int(m) * 60.0 + float(s)
+
+
+def test_ass_tight_line_transitions_never_overlap_or_start_late(tmp_path):
+    from karaoke.ass_writer import generate_ass_from_lines
+
+    lines = [
+        [{"text": "Первая", "start": 3.00, "end": 4.00, "syllables": 3}, {"text": "строка", "start": 4.05, "end": 5.00, "syllables": 3}],
+        [{"text": "Вторая", "start": 5.02, "end": 5.60, "syllables": 3}, {"text": "строка", "start": 5.62, "end": 6.20, "syllables": 3}],
+        [{"text": "Третья", "start": 6.80, "end": 7.30, "syllables": 2}, {"text": "строка", "start": 7.35, "end": 8.00, "syllables": 3}],
+    ]
+    out_ass = tmp_path / "tight.ass"
+    generate_ass_from_lines(lines, out_ass, visual_effects="none")
+
+    active_events = []
+    for raw in out_ass.read_text(encoding="utf-8").splitlines():
+        if raw.startswith("Dialogue:") and ",KaraokeActive," in raw:
+            parts = raw.split(",", 9)
+            active_events.append((_parse_ass_time_seconds(parts[1]), _parse_ass_time_seconds(parts[2])))
+
+    assert len(active_events) == 3
+    # Line 1 must finish by Line 2's first word start (5.02s), and Line 2 must start <= 5.02s
+    assert active_events[0][1] <= 5.02 + 1e-6
+    assert active_events[1][0] <= 5.02 + 1e-6
+    # No two active lines overlap
+    for (s1, e1), (s2, e2) in zip(active_events, active_events[1:]):
+        assert e1 <= s2 + 1e-6
+
+
+def test_build_karaoke_line_tags_uses_syllable_timings_for_sustained_first_syllable():
+    from karaoke.ass_writer import build_karaoke_line_tags
+
+    word = {
+        "text": "море",
+        "start": 1.0,
+        "end": 2.2,
+        "syllables": 2,
+        "syllable_timings": [
+            {"text": "мо", "start": 1.0, "end": 2.0},
+            {"text": "ре", "start": 2.0, "end": 2.2},
+        ],
+    }
+    tags = build_karaoke_line_tags([word], display_start=1.0, display_end=2.5)
+    assert "{\\kf100}мо{\\kf20}ре" in tags
+
+
+def test_adaptive_vocal_offset_handles_quiet_verse_and_loud_chorus():
+    import numpy as np
+    from karaoke.aligner import find_vocal_offset
+
+    hop_s = 0.01
+    rms = np.zeros(1000, dtype=np.float32)  # 10.0s
+    rms[100:400] = 0.04   # quiet verse: 1.0s - 4.0s
+    rms[500:900] = 0.50   # loud chorus: 5.0s - 9.0s
+    rms[900:980] = 0.035  # quiet reverb tail: 9.0s - 9.8s
+
+    verse_off = find_vocal_offset(rms, hop_s, 1.0, 4.5, min_silence_s=0.20)
+    assert 3.95 <= verse_off <= 4.15
+
+    chorus_off = find_vocal_offset(rms, hop_s, 6.0, 10.0, min_silence_s=0.20)
+    assert 8.95 <= chorus_off <= 9.15
+
+
+def test_mms_fa_transliteration_and_syllable_onsets():
+    import torchaudio
+    from karaoke.aligner import _word_syllables_to_mms_tokens, _build_syllable_timings_from_onsets, split_word_into_syllables
+
+    vocab = torchaudio.pipelines.MMS_FA.get_dict()
+    sylls = split_word_into_syllables("свобода")
+    assert sylls == ["сво", "бо", "да"]
+
+    mapped = _word_syllables_to_mms_tokens("свобода", vocab)
+    assert len(mapped) == 3
+    assert all(len(tids) >= 2 for _, tids in mapped)
+
+    # Sustained middle syllable ("бо" from 1.2s to 2.2s)
+    timings = _build_syllable_timings_from_onsets(sylls, [1.0, 1.2, 2.2], 1.0, 2.4)
+    assert [t["text"] for t in timings] == ["сво", "бо", "да"]
+    assert timings[1]["end"] - timings[1]["start"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_editor_text_to_lines_honors_manual_stretch_and_slight_overlap():
+    original = [
+        words("Лучше я поиграю", 10.0, 0.5),  # 10.0 .. 11.5
+        words("Вон с тем мужиком", 12.5, 0.4),  # 12.5 .. 14.1
+    ]
+    # 1. User stretches line 0 earlier (9.40) and later (12.20)
+    edited_stretch = "[00:09.40 -> 00:12.20] Лучше я поиграю\n[00:12.50 -> 00:14.10] Вон с тем мужиком"
+    res1 = editor_text_to_lines(edited_stretch, original_lines=original)
+    validate_karaoke_lines(res1)
+    assert res1[0][0]["start"] == pytest.approx(9.40, abs=0.02)
+    assert res1[0][-1]["end"] == pytest.approx(12.20, abs=0.02)
+
+    # 2. User extends line 0 slightly past line 1's start (12.70 > 12.50)
+    edited_overlap = "[00:09.40 -> 00:12.70] Лучше я поиграю\n[00:12.50 -> 00:14.10] Вон с тем мужиком"
+    res2 = editor_text_to_lines(edited_overlap, original_lines=original)
+    validate_karaoke_lines(res2)
+    assert res2[0][0]["start"] == pytest.approx(9.40, abs=0.02)
+    assert res2[0][-1]["end"] == pytest.approx(12.50, abs=0.02)
+    assert res2[1][0]["start"] == pytest.approx(12.50, abs=0.02)
+
+
+
+
 
 
 

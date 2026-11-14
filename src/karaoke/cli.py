@@ -34,7 +34,7 @@ def analyze_and_transcribe(
     demucs_model: str = "htdemucs",
     language: str = "ru",
     reference_lyrics: Optional[str] = None,
-    use_ctc_align: bool = False,
+    use_ctc_align: bool = True,
     device: Optional[str] = None,
     download_video: bool = False,
     cookies_browser: Optional[str] = "chrome",
@@ -60,6 +60,7 @@ def analyze_and_transcribe(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir = output_dir / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     log("Шаг 1/4: Получение аудиофайла и извлечение обложки...", 0.10)
     raw_audio, title, cover_path, video_bg = get_audio_from_source(
@@ -122,6 +123,9 @@ def analyze_and_transcribe(
         device=device,
     )
 
+    from karaoke.alignment_qa import optimize_alignment_to_target, format_alignment_report_summary
+
+    has_ref = bool(reference_lyrics and reference_lyrics.strip())
     log(f"Шаг 3/4: Распознавание текста и калибровка таймингов ({model_size}, язык={language})...", 0.55)
     transcription = transcribe_vocals(
         vocals_path=vocals_wav,
@@ -129,7 +133,7 @@ def analyze_and_transcribe(
         language=language,
         device=device,
         initial_prompt=None,  # Do not feed sequential lyrics as initial_prompt to prevent Whisper intro hallucinations
-        use_ctc_align=use_ctc_align,
+        use_ctc_align=(False if has_ref else use_ctc_align),
         condition_on_previous_text=condition_on_previous_text,
         vad=vad,
     )
@@ -144,7 +148,7 @@ def analyze_and_transcribe(
             raw_recognized_words,
             reference_lyrics=reference_lyrics,
             vocals_path=vocals_wav,
-            whisper_model=whisper_model,
+            whisper_model=model_size,
             work_dir=work_dir,
         )
 
@@ -156,7 +160,34 @@ def analyze_and_transcribe(
         warnings_out=alignment_warnings,
         vocals_path=vocals_wav,
         strict_repeats=strict_repeats,
+        use_ctc_align=use_ctc_align,
     )
+    # Previous version of this project (if any): keep it in history and reuse the user's line marks
+    from karaoke import timing_history
+
+    state_path = work_dir / f"{title}_state.json"
+    prev_state: Dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            prev_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            prev_state = {}
+    prev_marks = prev_state.get("line_marks") or []
+    locked_lines, bad_lines = timing_history.marks_to_constraints(lines, prev_marks)
+    if locked_lines or bad_lines:
+        log(f"Учитываю отметки: 🔒 {len(locked_lines)} хороших строк, 👎 {len(bad_lines)} плохих", 0.66)
+
+    lines, alignment_report = optimize_alignment_to_target(
+        lines,
+        vocals_path=vocals_wav,
+        target_score=90.0,
+        recognized_words=raw_recognized_words,
+        locked_lines=locked_lines,
+        bad_lines=bad_lines,
+    )
+    qa_summary = format_alignment_report_summary(alignment_report)
+    if qa_summary:
+        print(f"[Karaoke] {qa_summary}")
     validate_karaoke_lines(lines)
     editor_text = lines_to_editor_text(lines)
 
@@ -167,7 +198,8 @@ def analyze_and_transcribe(
     auto_fx = detect_chorus_fx_intervals(no_vocals_wav, vocals_wav)
 
     # Save state for fast re-rendering without re-running AI models
-    state_path = work_dir / f"{title}_state.json"
+    if prev_state.get("lines"):
+        timing_history.save_snapshot(work_dir, title, prev_state, reason="regenerate")
     state_data = {
         "title": title,
         "source": source,
@@ -196,6 +228,8 @@ def analyze_and_transcribe(
         "lines": lines,
         "editor_text": editor_text,
         "alignment_warnings": alignment_warnings,
+        "alignment_report": alignment_report,
+        "line_marks": timing_history.refresh_mark_timings(lines, prev_marks),
         "inst_peaks": inst_peaks,
         "vocal_peaks": vocal_peaks,
         "duration": duration,
@@ -246,6 +280,7 @@ def render_from_state(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir = output_dir / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     title = state_data["title"]
     vocals_wav = Path(state_data["vocals_wav"])
@@ -424,7 +459,7 @@ def run_pipeline(
     vocal_volume: float = 0.0,
     num_lines: int = 4,
     reference_lyrics: Optional[str] = None,
-    use_ctc_align: bool = False,
+    use_ctc_align: bool = True,
     device: Optional[str] = None,
     cookies_browser: Optional[str] = "chrome",
     cookies_file: Optional[Path] = None,
@@ -489,7 +524,7 @@ def main():
     parser.add_argument("--vocal-volume", type=float, default=0.0, help="Guide vocal volume (0.00 to 1.00)")
     parser.add_argument("--num-lines", type=int, default=4, choices=[3, 4], help="Karaoke lines on screen (3 or 4)")
     parser.add_argument("--reference-lyrics", default=None, help="Reference text file for alignment")
-    parser.add_argument("--use-ctc", action="store_true", help="Enable Cyrillic Wav2Vec2 CTC alignment")
+    parser.add_argument("--use-ctc", action=argparse.BooleanOptionalAction, default=True, help="Enable CTC forced alignment (MMS_FA)")
     parser.add_argument("--watermark", default=None, help="Custom DJ / Club branding watermark text in top-right corner")
     parser.add_argument("--no-dual-audio", action="store_true", help="Disable multiplexing the 2nd 100%% vocal guide audio track into MP4")
     parser.add_argument("--export-dj-pack", action="store_true", help="Also export professional DJ pack (.kfn, .cdg.zip, .lrc, UltraStar .txt)")

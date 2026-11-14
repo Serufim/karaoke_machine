@@ -46,6 +46,39 @@ export interface GenerationParams {
   num_lines?: number
 }
 
+export interface AlignmentReport {
+  overall_score: number
+  onset_score: number
+  coverage_score: number
+  hang_score: number
+  tempo_score: number
+  locked_lines?: number[]
+  changed_bad_lines?: number[]
+  unchanged_bad_lines?: number[]
+  anchor_repaired_lines?: number[]
+  problem_lines?: Array<{
+    line_idx: number
+    score: number
+    issues: string[]
+  }>
+}
+
+export interface TimingSnapshotMeta {
+  id: string
+  created_at: string
+  reason: string
+  reason_label: string
+  overall_score?: number | null
+  marks_summary: { good: number; bad: number }
+  line_count: number
+}
+
+export interface LineTimingDiff {
+  start_shift: number
+  end_shift: number
+  max_word_shift?: number | null
+}
+
 export interface ProjectState {
   title: string
   duration: number
@@ -68,6 +101,7 @@ export interface ProjectState {
   source_type?: 'file' | 'url'
   reference_lyrics?: string
   generation_params?: GenerationParams
+  alignment_report?: AlignmentReport
 }
 
 export interface ProjectMeta {

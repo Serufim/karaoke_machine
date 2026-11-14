@@ -4,6 +4,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Tuple, Optional
+from PIL import Image, ImageDraw
 import yt_dlp
 from karaoke.cancel_manager import check_cancelled, run_cancellable_command, GenerationCancelledError
 from karaoke.media import probe_media, video_streams, audio_duration

@@ -1156,6 +1156,17 @@ def load_saved_project(project_title: str):
     fx_itv_json = json.dumps(state_data.get("fx_intervals", []))
     timeline_payload_json = _build_timeline_payload(state_data)
 
+    from karaoke.alignment_qa import evaluate_alignment_quality, format_alignment_report_summary
+
+    rep = state_data.get("alignment_report")
+    if not rep and state_data.get("lines") and vocals_val:
+        rep = evaluate_alignment_quality(state_data["lines"], Path(vocals_val))
+        state_data["alignment_report"] = rep
+    qa_str = format_alignment_report_summary(rep)
+    status_msg = f"✅ Загружен проект: {project_title}. 3-дорожечный таймлайн синхронизирован с видео!"
+    if qa_str:
+        status_msg += f" | {qa_str}"
+
     return (
         state_data,
         editor_text,
@@ -1165,7 +1176,7 @@ def load_saved_project(project_title: str):
         vocal_itv_json,
         fx_itv_json,
         timeline_payload_json,
-        f"✅ Загружен проект: {project_title}. 3-дорожечный таймлайн синхронизирован с видео!",
+        status_msg,
     )
 
 
@@ -1506,6 +1517,11 @@ def run_full_karaoke_ui(
         except Exception:
             effective_video_path = final_video
 
+        from karaoke.alignment_qa import format_alignment_report_summary
+        qa_str = format_alignment_report_summary(state_data.get("alignment_report"))
+        done_msg = f"✅ Готово (Full HD 1080p): {final_video.name}! " + " ".join(state_data.get("alignment_warnings", []))
+        if qa_str:
+            done_msg += f" | {qa_str}"
         return (
             state_data,
             updated_editor_text,
@@ -1515,7 +1531,7 @@ def run_full_karaoke_ui(
             vocal_itv_json,
             fx_itv_json,
             timeline_payload_json,
-            f"✅ Готово (Full HD 1080p): {final_video.name}! " + " ".join(state_data.get("alignment_warnings", [])),
+            done_msg,
             gr.update(choices=choices, value=state_data["title"]),
         )
     except GenerationCancelledError as e:
@@ -1523,6 +1539,48 @@ def run_full_karaoke_ui(
         return (*[gr.skip() for _ in range(8)], str(e), gr.skip())
     except Exception as e:
         raise gr.Error(f"Ошибка при создании караоке: {str(e)}")
+
+
+def optimize_project_timings_ui(
+    state_data: Optional[Dict[str, Any]],
+    editor_text: str,
+    vocal_intervals_json: str,
+    fx_intervals_json: str,
+):
+    """Runs iterative acoustic QA optimization on current lines toward 90%+ vocal alignment."""
+    if not state_data:
+        raise gr.Error("Сначала загрузите или сгенерируйте песню.")
+    from karaoke.alignment_qa import optimize_alignment_to_target, format_alignment_report_summary
+
+    original_lines = state_data.get("lines", [])
+    vocals_wav = Path(state_data["vocals_wav"]) if state_data.get("vocals_wav") else None
+    current_lines = editor_text_to_lines(editor_text, original_lines=original_lines, vocals_path=vocals_wav) if editor_text else original_lines
+    opt_lines, report = optimize_alignment_to_target(
+        current_lines,
+        vocals_path=vocals_wav,
+        target_score=90.0,
+        recognized_words=state_data.get("recognized_words"),
+    )
+    new_editor_text = lines_to_editor_text(opt_lines)
+
+    state_data["lines"] = opt_lines
+    state_data["editor_text"] = new_editor_text
+    state_data["alignment_report"] = report
+    state_data["vocal_intervals"] = _parse_intervals_json(vocal_intervals_json)
+    state_data["fx_intervals"] = _parse_intervals_json(fx_intervals_json)
+
+    title = state_data.get("title")
+    if title:
+        state_file = Path("./output/work").resolve() / f"{title}_state.json"
+        if state_file.parent.exists():
+            state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return (
+        state_data,
+        new_editor_text,
+        _build_timeline_payload(state_data),
+        f"{format_alignment_report_summary(report)} — тайминги оптимизированы! Нажмите «Пересобрать видео».",
+    )
 
 
 def rebuild_video_from_editor_ui(
@@ -1853,6 +1911,7 @@ def build_ui():
                     with gr.Tab("📝 Текст и тайминги", id="tab-lyrics"):
                         with gr.Row():
                             realign_btn = gr.Button("⏱️ Пересчитать тайминги", variant="primary", size="sm")
+                            optimize_timings_btn = gr.Button("🎯 Автоподгонка (90%+)", variant="secondary", size="sm")
                             seek_line_btn = gr.Button("▶️ К строке в видео", variant="secondary", size="sm")
                         with gr.Row():
                             regroup_btn = gr.Button("✨ Авто-склейка коротких", variant="secondary", size="sm")
@@ -1967,8 +2026,8 @@ def build_ui():
                             )
                             lang_box = gr.Textbox(label="Код языка", value="ru")
                             ctc_checkbox = gr.Checkbox(
-                                label="Кириллическое CTC выравнивание (Wav2Vec2)",
-                                value=False,
+                                label="Точное CTC выравнивание вокала и слогов (MMS_FA)",
+                                value=True,
                             )
                             ref_lyrics_box = gr.Textbox(
                                 label="Вставьте текст песни (опционально)",
@@ -2248,6 +2307,22 @@ def build_ui():
             queue=False,
         ).then(
             fn=realign_project_timings_ui,
+            inputs=[state_store, editor_box, vocal_intervals_box, fx_intervals_box],
+            outputs=[state_store, editor_box, studio_data_box, status_box],
+        ).then(
+            fn=None,
+            inputs=[studio_data_box],
+            js=PUSH_TIMELINE_JSON_JS,
+        )
+
+        optimize_timings_btn.click(
+            fn=sync_timeline_boxes_ui,
+            inputs=[vocal_intervals_box, fx_intervals_box],
+            outputs=[vocal_intervals_box, fx_intervals_box],
+            js=SYNC_TIMELINE_TO_GRADIO_JS,
+            queue=False,
+        ).then(
+            fn=optimize_project_timings_ui,
             inputs=[state_store, editor_box, vocal_intervals_box, fx_intervals_box],
             outputs=[state_store, editor_box, studio_data_box, status_box],
         ).then(
