@@ -26,6 +26,9 @@ def align_audio_slice(
     text: str,
     mode: str = "whisper",
     work_dir: Optional[Path] = None,
+    vocals_path: Optional[Path] = None,
+    model_size: str = "large-v3-turbo",
+    allow_rms_fallback: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Surgically calibrates lyrics timestamps for a specific audio slice [start, end].
@@ -47,8 +50,8 @@ def align_audio_slice(
         return []
 
     state_file = work_dir / f"{title}_state.json"
-    vocals_wav = None
-    if state_file.exists():
+    vocals_wav = Path(vocals_path) if vocals_path and Path(vocals_path).exists() else None
+    if vocals_wav is None and state_file.exists():
         try:
             state_data = json.loads(state_file.read_text(encoding="utf-8"))
             if state_data.get("vocals_wav") and Path(state_data["vocals_wav"]).exists():
@@ -74,7 +77,7 @@ def align_audio_slice(
 
             res = transcribe_vocals(
                 vocals_path=slice_wav,
-                model_size="large-v3-turbo",
+                model_size=model_size,
                 language="ru",
                 initial_prompt=text_clean,
                 condition_on_previous_text=False,
@@ -96,6 +99,8 @@ def align_audio_slice(
                         })
 
             if rec_words:
+                if not allow_rms_fallback:
+                    return rec_words
                 aligned = align_words_to_reference_lines(
                     rec_words,
                     [text_clean],
@@ -114,6 +119,9 @@ def align_audio_slice(
                     slice_wav.unlink()
                 except Exception:
                     pass
+
+    if mode == "whisper" and not allow_rms_fallback:
+        return []
 
     # Method 2: Syllable count + Vocal RMS energy envelope (robust fallback)
     rms, hop_s = compute_vocal_rms_envelope(vocals_wav) if vocals_wav else (None, 0.01)

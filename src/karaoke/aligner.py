@@ -75,6 +75,227 @@ def sanitize_reference_lyrics(text_or_lines: Any) -> List[str]:
     return result
 
 
+_PEG_LINE_RE = re.compile(
+    r"^\s*\[\s*(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)"
+    r"(?:\s*[-\u2013\u2014]\s*(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?))?"
+    r"\s*\]\s*(.*)$"
+)
+_NO_WORDS_RANGE_RE = re.compile(
+    r"(\d{1,3}:\d{1,2}(?:[.,]\d{1,3})?|\d+(?:[.,]\d+)?)\s*[-\u2013\u2014]{1,2}\s*"
+    r"(\d{1,3}:\d{1,2}(?:[.,]\d{1,3})?|\d+(?:[.,]\d+)?)"
+)
+_VOICE_DIR_RE = re.compile(r"^\s*\[\s*(?:voice|голос|вокал)\s*([12])\s*\]\s*$", re.I)
+_VOICE_LINE_PREFIX_RE = re.compile(r"^\s*([12])\s*[:>]\s+(.+)$")
+_REPEAT_MULT_RE = re.compile(r"^(.*?)\s*[\(\[]?\s*[x×хХ]\s*(\d{1,2})\s*[\)\]]?\s*$", re.I)
+_ROUND_BACKING_RE = re.compile(r"^\s*\(([^()]{1,80})\)\s*$")
+_TRAIL_BACKING_RE = re.compile(r"^(.*\S)\s+(\([^()]{1,60}\))$")
+
+
+def _parse_mmss_to_sec(mm: str, ss: str) -> float:
+    return int(mm) * 60.0 + float(ss.replace(":", ".").replace(",", "."))
+
+
+def _parse_time_token(tok: str) -> float:
+    t = tok.strip().replace(",", ".")
+    if ":" in t:
+        m_s, s_s = t.split(":", 1)
+        return int(m_s) * 60.0 + float(s_s)
+    return float(t)
+
+
+def parse_reference_lyrics_directives(text_or_lines: Any) -> Dict[str, Any]:
+    """
+    Parses extended lyrics directives (compatible with free-karaoke-editor):
+    - Sparse pegs: `[1:05] line` or `[1:05.25-1:09.50] line`
+    - No-words zones: `[Guitar solo 3:10-3:50]`, `[no words 0:00-0:21]`, `[3:10-3:50]`
+    - Two voices / backing: `[voice 2]`, `2: line`, `(backing line)`, `lead (backing)`
+    - Repeats: `Chorus x4`, `Line (x2)`, `Line ×3`
+    - Sung | Shown: `Натуральные числа | N`
+    Returns {"lines": List[Dict], "no_words_ranges": List[Tuple[float, float]]}.
+    """
+    if isinstance(text_or_lines, str):
+        raw_lines = text_or_lines.splitlines()
+    elif isinstance(text_or_lines, (list, tuple)):
+        raw_lines = [str(x) for x in text_or_lines]
+    else:
+        return {"lines": [], "no_words_ranges": []}
+
+    parsed_lines: List[Dict[str, Any]] = []
+    no_words_ranges: List[Tuple[float, float]] = []
+    current_voice = 1
+
+    for raw in raw_lines:
+        line = str(raw).strip()
+        if not line or re.match(r"^[-=*_#\s]+$", line):
+            continue
+        if METADATA_LINE_RE.search(line):
+            continue
+
+        # Voice switch directive: [voice 2] / [голос 2]
+        vm = _VOICE_DIR_RE.match(line)
+        if vm:
+            current_voice = int(vm.group(1))
+            continue
+
+        # Bracketed line: check for [mm:ss] peg vs [no words 1:02-1:40] vs [Chorus]
+        peg_start: Optional[float] = None
+        peg_end: Optional[float] = None
+        pm = _PEG_LINE_RE.match(line)
+        if pm:
+            peg_start = _parse_mmss_to_sec(pm.group(1), pm.group(2))
+            if pm.group(3) is not None and pm.group(4) is not None:
+                pe = _parse_mmss_to_sec(pm.group(3), pm.group(4))
+                if pe > peg_start + 0.05:
+                    peg_end = pe
+            body = pm.group(5).strip()
+            if not body:
+                if peg_start is not None and peg_end is not None:
+                    no_words_ranges.append((peg_start, peg_end))
+                continue
+            line = body
+        elif line.startswith("[") and line.endswith("]"):
+            nwm = _NO_WORDS_RANGE_RE.search(line[1:-1])
+            if nwm:
+                try:
+                    t0 = _parse_time_token(nwm.group(1))
+                    t1 = _parse_time_token(nwm.group(2))
+                    if t1 > t0 + 0.05:
+                        no_words_ranges.append((t0, t1))
+                except ValueError:
+                    pass
+            continue
+
+        if STRUCTURE_LINE_RE.match(line):
+            continue
+        if REPEAT_STANDALONE_RE.match(line):
+            continue
+
+        line_voice = current_voice
+        vlm = _VOICE_LINE_PREFIX_RE.match(line)
+        if vlm:
+            line_voice = int(vlm.group(1))
+            line = vlm.group(2).strip()
+
+        # Check round-bracket backing vocal vs section header like (Припев)
+        rbm = _ROUND_BACKING_RE.match(line)
+        if rbm:
+            inner = rbm.group(1).strip()
+            if STRUCTURE_LINE_RE.match(f"({inner})") or REPEAT_STANDALONE_RE.match(f"({inner})"):
+                continue
+            line_voice = 2
+
+        # Expand repeats: "Chorus x4" -> 4 copies
+        repeat_count = 1
+        rm = _REPEAT_MULT_RE.match(line)
+        if rm:
+            body_r = rm.group(1).strip()
+            times_r = int(rm.group(2))
+            if body_r and 2 <= times_r <= 20 and re.search(r"[а-яёa-z0-9]", body_r, re.I):
+                line = body_r
+                repeat_count = times_r
+        else:
+            line = REPEAT_INLINE_RE.sub("", line).strip()
+
+        if not line:
+            continue
+
+        # Sung | Shown split
+        sung_part = line
+        shown_part: Optional[str] = None
+        if "|" in line:
+            left_p, right_p = line.split("|", 1)
+            if left_p.strip() and right_p.strip():
+                sung_part = left_p.strip()
+                shown_part = right_p.strip()
+
+        # Trailing backing vocal: "Main line (oh-oh)" -> lead + voice-2 backing
+        tbm = _TRAIL_BACKING_RE.match(sung_part) if shown_part is None else None
+        entries: List[Dict[str, Any]] = []
+        if tbm and not REPEAT_STANDALONE_RE.match(tbm.group(2)):
+            entries.append({
+                "sung_text": tbm.group(1).strip(),
+                "shown_text": None,
+                "peg_start": peg_start,
+                "peg_end": peg_end,
+                "voice": line_voice,
+            })
+            entries.append({
+                "sung_text": tbm.group(2).strip(),
+                "shown_text": None,
+                "peg_start": None,
+                "peg_end": None,
+                "voice": 2,
+            })
+        else:
+            entries.append({
+                "sung_text": sung_part,
+                "shown_text": shown_part,
+                "peg_start": peg_start,
+                "peg_end": peg_end,
+                "voice": line_voice,
+            })
+
+        for r_i in range(repeat_count):
+            for e_idx, ent in enumerate(entries):
+                item = dict(ent)
+                if r_i > 0:
+                    item["peg_start"] = None
+                    item["peg_end"] = None
+                parsed_lines.append(item)
+
+    return {"lines": parsed_lines, "no_words_ranges": no_words_ranges}
+
+
+def split_line_by_breath_pause(
+    lines: List[List[Dict[str, Any]]],
+    line_idx: int,
+    word_idx: Optional[int] = None,
+) -> List[List[Dict[str, Any]]]:
+    """
+    Splits `lines[line_idx]` into two lines at the longest inter-word pause (breath point)
+    or at `word_idx` (words[0:word_idx] and words[word_idx:]), preserving all word & syllable timings.
+    """
+    import copy
+
+    if not (0 <= line_idx < len(lines)):
+        return lines
+    ln = lines[line_idx]
+    if len(ln) < 2:
+        return lines
+
+    if word_idx is not None and 1 <= word_idx < len(ln):
+        split_at = word_idx
+    else:
+        best_gap = -1.0
+        split_at = len(ln) // 2
+        for k in range(len(ln) - 1):
+            gap = float(ln[k + 1]["start"]) - float(ln[k]["end"])
+            if gap > best_gap:
+                best_gap = gap
+                split_at = k + 1
+
+    out = copy.deepcopy(lines)
+    part1 = out[line_idx][:split_at]
+    part2 = out[line_idx][split_at:]
+    out[line_idx : line_idx + 1] = [part1, part2]
+    return out
+
+
+def join_with_next_line(
+    lines: List[List[Dict[str, Any]]],
+    line_idx: int,
+) -> List[List[Dict[str, Any]]]:
+    """Joins `lines[line_idx]` with `lines[line_idx + 1]`, preserving all word & syllable timings."""
+    import copy
+
+    if not (0 <= line_idx < len(lines) - 1):
+        return lines
+    out = copy.deepcopy(lines)
+    merged = out[line_idx] + out[line_idx + 1]
+    out[line_idx : line_idx + 2] = [merged]
+    return out
+
+
 def count_syllables(word: str) -> int:
     """Counts syllables in a Russian/English word based on vowel count (min 1)."""
     cleaned = re.sub(r"[^а-яёА-ЯЁa-zA-Z]", "", word)
@@ -87,10 +308,17 @@ def count_syllables(word: str) -> int:
 def split_word_into_syllables(word: str) -> List[str]:
     """
     Splits a Russian or multilingual word into phonetic/musical syllables for karaoke highlighting.
+    Supports explicit user markers (`=` or soft hyphen `\u00ad`, e.g. `фо=то=гра=фи=я`).
     Preserves all leading/trailing punctuation, hyphens, and characters exactly (sum of parts == word).
     """
     if not word or len(word) <= 2:
         return [word]
+
+    if "=" in word or "\u00ad" in word:
+        explicit = [p for p in re.split(r"[=\u00ad]+", word) if p]
+        if len(explicit) >= 2:
+            return explicit
+        word = word.replace("=", "").replace("\u00ad", "")
 
     has_cyrillic = bool(re.search(r"[а-яёА-ЯЁ]", word))
     if not has_cyrillic:
@@ -564,8 +792,8 @@ def estimate_acoustic_syllable_timings(
 ) -> List[Dict[str, Any]]:
     """
     Acoustic fallback for syllable timings when CTC forced alignment is unavailable.
-    Uses vocal RMS energy distribution inside [w_start, w_end] to detect which syllable
-    carries a sustained vocal hold instead of blindly stretching the final syllable.
+    Uses vocal onset flux (positive RMS gradient) and energy distribution inside
+    [w_start, w_end] so syllable boundaries snap to actual sung vowel attacks.
     """
     sylls = split_word_into_syllables(word_text)
     n = len(sylls)
@@ -575,14 +803,58 @@ def estimate_acoustic_syllable_timings(
     dur = w_end - w_start
     weights = [max(1.0, float(len([c for c in s if c.isalnum()]))) for s in sylls]
 
-    if rms is not None and len(rms) > 0 and dur >= 0.45:
+    if rms is not None and len(rms) > 0 and dur >= 0.18:
         i_s = max(0, int(w_start / hop_s))
-        i_e = min(len(rms), int(w_end / hop_s))
+        i_e = min(len(rms), int(round(w_end / hop_s)))
         win = rms[i_s:i_e]
-        if len(win) >= n * 3:
-            # Measure RMS energy in equal candidate bins; boost syllables whose bin has sustained energy
-            peak = float(np.max(win)) if len(win) > 0 else 0.0
+        if len(win) >= max(n * 3, 6):
+            peak = float(np.max(win))
             if peak > 0.008:
+                # Try onset-flux + valley boundary snapping near expected positions
+                flux = np.maximum(0.0, np.diff(win, prepend=win[0]))
+                flux_max = float(np.max(flux))
+                if flux_max > 1e-6:
+                    tot_w = max(1e-6, sum(weights))
+                    cum_fracs = []
+                    acc = 0.0
+                    for w in weights[:-1]:
+                        acc += w / tot_w
+                        cum_fracs.append(acc)
+
+                    win_len = len(win)
+                    min_step_frames = max(2, int(round(max(0.04, 0.25 * dur / n) / hop_s)))
+                    bounds = [0]
+                    for k, frac in enumerate(cum_fracs):
+                        exp_idx = int(round(frac * win_len))
+                        margin = max(2, int(round(0.28 * win_len / n)))
+                        lo = max(bounds[-1] + min_step_frames, exp_idx - margin)
+                        hi = min(win_len - min_step_frames * (n - 1 - k), exp_idx + margin)
+                        if lo <= hi:
+                            best_idx = exp_idx
+                            best_score = -1e9
+                            for cand in range(lo, hi + 1):
+                                f_norm = float(flux[cand]) / flux_max
+                                prev_e = float(win[max(0, cand - 1)]) / peak
+                                dist_pen = 0.20 * abs(cand - exp_idx) / max(1, margin)
+                                sc = 0.65 * f_norm - 0.25 * prev_e - dist_pen
+                                if sc > best_score:
+                                    best_score = sc
+                                    best_idx = cand
+                            bounds.append(best_idx)
+                        else:
+                            bounds.append(max(bounds[-1] + 1, min(win_len - 1, exp_idx)))
+                    bounds.append(win_len)
+
+                    if len(bounds) == n + 1 and all(bounds[k + 1] > bounds[k] for k in range(n)):
+                        timings: List[Dict[str, Any]] = []
+                        for k, s_txt in enumerate(sylls):
+                            s_t = round(w_start if k == 0 else w_start + (bounds[k] / win_len) * dur, 3)
+                            e_t = round(w_end if k == n - 1 else w_start + (bounds[k + 1] / win_len) * dur, 3)
+                            if e_t <= s_t:
+                                e_t = round(s_t + 0.02, 3)
+                            timings.append({"text": s_txt, "start": s_t, "end": e_t})
+                        return timings
+
                 bin_edges = np.linspace(0, len(win), n + 1, dtype=int)
                 energies = []
                 for k in range(n):
@@ -593,7 +865,7 @@ def estimate_acoustic_syllable_timings(
 
     tot_w = max(1e-6, sum(weights))
     cursor = w_start
-    timings: List[Dict[str, Any]] = []
+    timings = []
     for k, (s_txt, w) in enumerate(zip(sylls, weights)):
         s_dur = dur * (w / tot_w)
         s_start = round(cursor, 3)
@@ -1036,8 +1308,11 @@ def regroup_words_into_logical_lines(
             cur = []
             continue
 
-        # 4. Capitalized next word after a full clause (>= 18 chars & >= 3 words)
-        if nxt_first.isupper() and cur_chars >= 18 and len(cur) >= 3:
+        # 4. Capitalized next word after a Whisper segment boundary or pause >= 0.22s, or after a full clause
+        if nxt_first.isupper() and (
+            ((w.get("_seg_end") or gap >= 0.22) and len(cur) >= 2)
+            or (cur_chars >= 18 and len(cur) >= 3)
+        ):
             clauses.append(cur)
             cur = []
             continue
@@ -1095,11 +1370,14 @@ def regroup_words_into_logical_lines(
             prev_chars = sum(len(x["text"]) + 1 for x in prev) - 1
             gap = line[0]["start"] - prev[-1]["end"]
             prev_end_punct = prev[-1]["text"].strip()[-1:] in ".!?;…"
+            first_char = re.sub(r"^[^а-яёА-ЯЁa-zA-Z]+", "", line[0]["text"].strip())[:1]
+            starts_new_sentence = first_char.isupper() and (prev[-1].get("_seg_end") or gap >= 0.22)
             if (
                 len(line) <= 3
                 and l_chars < 14
                 and gap < 0.5
                 and not prev_end_punct
+                and not starts_new_sentence
                 and (prev_chars + 1 + l_chars <= 54)
             ):
                 prev.extend(line)
@@ -1117,7 +1395,7 @@ def split_into_karaoke_lines(
     warnings_out: Optional[List[str]] = None,
     vocals_path: Optional[Path] = None,
     strict_repeats: bool = False,
-    use_ctc_align: bool = True,
+    use_ctc_align: bool = False,
 ) -> List[List[Dict[str, Any]]]:
     """
     Splits refined segments into natural poetic karaoke lines.
@@ -1186,6 +1464,24 @@ def _normalize_word(text: str) -> str:
     return re.sub(r"[^\wа-яёa-z]", "", text.lower().replace("ё", "е"))
 
 
+def _latin_to_phonetic_ru(text: str) -> str:
+    """Rough phonetic transliteration of English/Latin tokens to Cyrillic for cross-script matching."""
+    t = text.lower()
+    for src, dst in (
+        ("sh", "ш"), ("ch", "ч"), ("th", "з"), ("ph", "ф"), ("oo", "у"), ("ee", "и"),
+        ("ea", "и"), ("ou", "ау"), ("ow", "оу"), ("igh", "ай"), ("ai", "ей"), ("ay", "ей"),
+        ("ck", "к"), ("qu", "кв"), ("wh", "у"), ("wr", "р"),
+    ):
+        t = t.replace(src, dst)
+    mapping = {
+        "a": "а", "b": "б", "c": "к", "d": "д", "e": "е", "f": "ф", "g": "г",
+        "h": "х", "i": "и", "j": "дж", "k": "к", "l": "л", "m": "м", "n": "н",
+        "o": "о", "p": "п", "q": "к", "r": "р", "s": "с", "t": "т", "u": "у",
+        "v": "в", "w": "у", "x": "кс", "y": "и", "z": "з",
+    }
+    return "".join(mapping.get(ch, ch) for ch in t)
+
+
 def _word_similarity(w1: str, w2: str) -> float:
     """Computes phonetic and morphological similarity between Russian/English word tokens."""
     if w1 == w2:
@@ -1196,6 +1492,11 @@ def _word_similarity(w1: str, w2: str) -> float:
     c2 = re.sub(r"[^\wа-яёa-z]", "", w2.lower()).replace("ё", "е")
     if c1 == c2:
         return 1.0
+    # Cross-script phonetic comparison (Latin <-> Cyrillic, e.g. "shit" <-> "щит", "here" <-> "хир")
+    if any("a" <= ch <= "z" for ch in c1) and not any("a" <= ch <= "z" for ch in c2):
+        c1 = _latin_to_phonetic_ru(c1)
+    elif any("a" <= ch <= "z" for ch in c2) and not any("a" <= ch <= "z" for ch in c1):
+        c2 = _latin_to_phonetic_ru(c2)
     # Russian demonstratives / pronouns case variations (этот / эта / это / эти / этой / этом / этого...)
     demonstratives = {"этот", "эта", "это", "эти", "этой", "этом", "этому", "этого", "этим", "этих"}
     if c1 in demonstratives and c2 in demonstratives:
@@ -1373,58 +1674,100 @@ def _distribute_words(tokens: List[str], start: float, end: float) -> List[Dict[
     return result
 
 
-def align_words_to_reference_lines(
+def _expand_recognized_words_for_ref(
     recognized_words: List[Dict[str, Any]],
-    ref_lines: List[str],
-    vocals_path: Optional[Path] = None,
-    strict_repeats: bool = False,
-    use_ctc_align: bool = True,
-) -> List[List[Dict[str, Any]]]:
+    ref_norms: List[str],
+    ref_raws: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """
-    Maps a user's reference lyric lines to the recognized word timestamps using fuzzy sequence alignment.
+    Normalizes Whisper `recognized_words` against reference tokens:
+    1) Splits hyphenated Whisper tokens (e.g. "Лос-Сантос", "Сан-Андрес") when the whole
+       hyphenated form is not a single reference token.
+    2) Splits single Whisper compound tokens that correspond to two consecutive reference words
+       (e.g. "Граустрите" -> "Гроув" + "Стрите", "бигсмол" -> "Биг" + "Смоук").
+    3) Merges 2 consecutive Whisper tokens that were split from 1 reference word.
     """
-    ref_lines = sanitize_reference_lyrics(ref_lines)
-    ref_tokenized: List[List[str]] = []
-    flat_ref: List[Tuple[int, str, str]] = []  # (line_idx, raw_word, normalized_word)
+    if not recognized_words or not ref_norms:
+        return list(recognized_words)
 
-    for l_idx, line_str in enumerate(ref_lines):
-        raw_tokens = [t for t in line_str.split() if t.strip()]
-        if not raw_tokens:
+    ref_norm_set = set(ref_norms)
+    raws = ref_raws if (ref_raws and len(ref_raws) == len(ref_norms)) else ref_norms
+
+    # Build consecutive reference bigrams for 1-rec -> 2-ref splitting
+    bigrams: List[Tuple[str, str, str, int, int]] = []
+    seen_bg: set = set()
+    for i in range(len(ref_norms) - 1):
+        n1, n2 = ref_norms[i], ref_norms[i + 1]
+        if len(n1) < 2 or len(n2) < 2:
             continue
-        # Merge standalone punctuation tokens (e.g. "—", "-", "...") to the preceding word
-        tokens: List[str] = []
-        for t in raw_tokens:
-            if re.sub(r"[^\wа-яёa-z]", "", t.lower()):
-                tokens.append(t)
-            elif tokens:
-                tokens[-1] += f" {t}"
-            else:
-                tokens.append(t)
-        if not tokens:
-            continue
-        ref_tokenized.append(tokens)
-        actual_l_idx = len(ref_tokenized) - 1
-        for t in tokens:
-            norm = _normalize_word(t)
-            flat_ref.append((actual_l_idx, t, norm))
+        combo = n1 + n2
+        if combo not in seen_bg:
+            seen_bg.add(combo)
+            s1 = max(1, count_syllables(raws[i]))
+            s2 = max(1, count_syllables(raws[i + 1]))
+            bigrams.append((combo, raws[i], raws[i + 1], s1, s2))
 
-    if not flat_ref or not recognized_words:
-        return []
+    # Step 1: Split hyphenated tokens and 1-rec -> 2-ref compounds
+    step1: List[Dict[str, Any]] = []
+    for rw in recognized_words:
+        txt = str(rw.get("text", ""))
+        w_s = float(rw.get("start", 0.0))
+        w_e = float(rw.get("end", w_s))
+        norm_w = _normalize_word(txt)
 
-    rms, hop_s = compute_vocal_rms_envelope(vocals_path)
+        # 1a. Hyphenated Whisper token (e.g. "Лос-Сантос," -> "Лос", "Сантос,")
+        if "-" in txt and norm_w and norm_w not in ref_norm_set:
+            parts = [p for p in re.split(r"-+", txt) if _normalize_word(p)]
+            if len(parts) >= 2 and all(len(_normalize_word(p)) >= 2 for p in parts):
+                part_syls = [max(1, count_syllables(p)) for p in parts]
+                tot_s = max(1, sum(part_syls))
+                dur = max(0.06 * len(parts), w_e - w_s)
+                cur = w_s
+                for idx_p, (p_txt, p_syl) in enumerate(zip(parts, part_syls)):
+                    p_dur = dur * (p_syl / tot_s)
+                    p_e = w_e if idx_p == len(parts) - 1 else round(cur + p_dur, 3)
+                    step1.append({
+                        "text": p_txt,
+                        "start": round(cur, 3),
+                        "end": round(max(cur + 0.04, p_e), 3),
+                        "syllables": p_syl,
+                    })
+                    cur = p_e
+                continue
 
-    # Check if Whisper split any single reference word into 2 consecutive adjacent tokens
-    # e.g. "три" + "пуфи" -> "трипуфи" matching "стрипухе"
-    ref_norm_set = set(item[2] for item in flat_ref)
-    processed_rec_words: List[Dict[str, Any]] = []
+        # 1b. Non-hyphenated 1-rec -> 2-ref compound (e.g. "Граустрите" -> "Гроув Стрите")
+        if len(norm_w) >= 6 and norm_w not in ref_norm_set and bigrams:
+            best_single = max((_word_similarity(rn, norm_w) for rn in ref_norm_set), default=0.0)
+            best_bg = None
+            best_bg_sim = 0.0
+            for combo, r1, r2, s1, s2 in bigrams:
+                if abs(len(combo) - len(norm_w)) > max(4, len(combo) // 2):
+                    continue
+                sim = _word_similarity(combo, norm_w)
+                if sim > best_bg_sim:
+                    best_bg_sim = sim
+                    best_bg = (r1, r2, s1, s2)
+            if best_bg is not None and best_bg_sim >= 0.72 and best_bg_sim > best_single + 0.06:
+                r1, r2, s1, s2 = best_bg
+                tot_s = max(1, s1 + s2)
+                dur = max(0.12, w_e - w_s)
+                mid = round(w_s + dur * (s1 / tot_s), 3)
+                step1.append({"text": r1, "start": round(w_s, 3), "end": mid, "syllables": s1})
+                step1.append({"text": r2, "start": mid, "end": round(max(mid + 0.05, w_e), 3), "syllables": s2})
+                continue
+
+        step1.append(rw)
+
+    # Step 2: Merge 2 consecutive Whisper tokens that were split from 1 reference word
+    processed: List[Dict[str, Any]] = []
     skip_next = False
-    for k in range(len(recognized_words)):
+    for k in range(len(step1)):
         if skip_next:
             skip_next = False
             continue
-        curr_w = recognized_words[k]
-        if k + 1 < len(recognized_words):
-            next_w = recognized_words[k + 1]
+        curr_w = step1[k]
+        if k + 1 < len(step1):
+            next_w = step1[k + 1]
             gap = float(next_w.get("start", 0.0)) - float(curr_w.get("end", 0.0))
             if gap <= 0.20:
                 combo_norm = _normalize_word(curr_w["text"] + next_w["text"])
@@ -1434,7 +1777,7 @@ def align_words_to_reference_lines(
                     max((_word_similarity(rn, _normalize_word(next_w["text"])) for rn in ref_norm_set), default=0.0),
                 )
                 if best_sim >= 0.76 and best_sim > indiv_sim + 0.15:
-                    processed_rec_words.append({
+                    processed.append({
                         "text": curr_w["text"] + next_w["text"],
                         "start": curr_w["start"],
                         "end": next_w["end"],
@@ -1442,49 +1785,293 @@ def align_words_to_reference_lines(
                     })
                     skip_next = True
                     continue
-        processed_rec_words.append(curr_w)
+        processed.append(curr_w)
+    return processed
 
-    recognized_words = processed_rec_words
+
+_VOWELLESS_PROCLITICS = {"в", "с", "к", "б", "ж", "ль"}
+
+
+def _clamp_proclitics_and_short_onsets(
+    line: List[Dict[str, Any]],
+    rms: Optional[np.ndarray],
+    hop_s: float,
+    prev_end: float = 0.0,
+) -> None:
+    """
+    Prevents vowelless prepositions ("в", "с", "к") from absorbing 0.3-0.5s pauses,
+    and trims overly stretched 1-syllable line-initial pickup words ("А", "И", "Как").
+    """
+    if len(line) < 2:
+        return
+
+    # 1. Clamp vowelless proclitics attached right before the next word
+    for idx in range(len(line) - 1):
+        w = line[idx]
+        nxt = line[idx + 1]
+        norm = _normalize_word(w["text"])
+        if norm not in _VOWELLESS_PROCLITICS:
+            continue
+        ws, we = float(w["start"]), float(w["end"])
+        ns = float(nxt["start"])
+        dur = we - ws
+        if dur > 0.16:
+            target_end = min(ns, we)
+            new_s = max(prev_end if idx == 0 else float(line[idx - 1]["end"]), target_end - 0.12)
+            if target_end - new_s >= 0.06:
+                if idx > 0 and abs(float(line[idx - 1]["end"]) - ws) <= 0.06:
+                    # Give the held vowel tail back to the preceding word when vocals are active
+                    give_back = True
+                    if rms is not None and len(rms) > 0:
+                        g_s = max(0, int(ws / hop_s))
+                        g_e = min(len(rms), int(new_s / hop_s))
+                        if g_e > g_s + 1 and float(np.mean(rms[g_s:g_e])) < 0.006:
+                            give_back = False
+                    if give_back:
+                        line[idx - 1]["end"] = round(new_s, 2)
+                w["start"] = round(new_s, 2)
+                w["end"] = round(target_end, 2)
+
+    # 2. Guard line-initial 1-syllable word from swallowing > 0.45s of breath/pause
+    w0, w1 = line[0], line[1]
+    if count_syllables(w0["text"]) == 1 and len(line) >= 3:
+        w0_s, w0_e = float(w0["start"]), float(w0["end"])
+        w0_dur = w0_e - w0_s
+        if w0_dur > 0.46:
+            rest_syls = sum(max(1, count_syllables(w["text"])) for w in line[1:])
+            rest_dur = max(0.2, float(line[-1]["end"]) - float(w1["start"]))
+            avg_syl = rest_dur / max(1, rest_syls)
+            cap_dur = max(0.24, min(0.42, avg_syl * 1.45))
+            if w0_dur > cap_dur + 0.08:
+                new_end = round(w0_s + cap_dur, 2)
+                if rms is not None and len(rms) > 0:
+                    onset_w1 = find_vocal_onset(rms, hop_s, new_end - 0.05, float(w1["end"]) - 0.08, fallback=new_end)
+                    if w0_s + 0.12 <= onset_w1 <= float(w1["end"]) - 0.08:
+                        new_end = round(min(new_end + 0.06, onset_w1), 2)
+                w0["end"] = new_end
+                # If w1 started right after old w0_e and is multi-syllable, pull w1 start toward the real onset
+                if abs(float(w1["start"]) - w0_e) <= 0.12 and count_syllables(w1["text"]) >= 2:
+                    w1["start"] = round(max(new_end, float(w1["start"]) - min(0.35, w0_e - new_end)), 2)
+
+
+def _match_line_words_to_whisper(
+    line: List[Dict[str, Any]],
+    recognized_words: List[Dict[str, Any]],
+    win_start: float,
+    win_end: float,
+) -> Dict[int, Tuple[float, float]]:
+    """
+    Monotonically matches words in `line` against expanded `recognized_words` near
+    [win_start - 0.45, win_end + 0.45]. Returns {word_idx: (rw_start, rw_end)}.
+    """
+    if not line or not recognized_words:
+        return {}
+    ref_norms = [_normalize_word(w["text"]) for w in line]
+    ref_raws = [str(w["text"]) for w in line]
+    exp_rw = _expand_recognized_words_for_ref(recognized_words, ref_norms, ref_raws)
+
+    candidates = [
+        rw for rw in exp_rw
+        if float(rw.get("end", 0.0)) >= win_start - 0.45 and float(rw.get("start", 0.0)) <= win_end + 0.45
+    ]
+    if not candidates:
+        return {}
+
+    rec_norms = [_normalize_word(rw["text"]) for rw in candidates]
+    matches: Dict[int, Tuple[float, float]] = {}
+    for tag, i1, i2, j1, j2 in _sequence_opcodes(ref_norms, rec_norms, candidates):
+        if tag == "equal":
+            for off in range(i2 - i1):
+                rw = candidates[j1 + off]
+                rs = float(rw["start"])
+                re_t = float(rw["end"])
+                if re_t >= rs:
+                    matches[i1 + off] = (rs, re_t)
+        elif tag == "replace" and (i2 - i1) == (j2 - j1):
+            for off in range(i2 - i1):
+                sim = _word_similarity(ref_norms[i1 + off], rec_norms[j1 + off])
+                if sim >= 0.65:
+                    rw = candidates[j1 + off]
+                    rs = float(rw["start"])
+                    re_t = float(rw["end"])
+                    if re_t >= rs:
+                        matches[i1 + off] = (rs, re_t)
+    return matches
+
+
+def align_words_to_reference_lines(
+    recognized_words: List[Dict[str, Any]],
+    ref_lines: List[str],
+    vocals_path: Optional[Path] = None,
+    strict_repeats: bool = False,
+    use_ctc_align: bool = False,
+) -> List[List[Dict[str, Any]]]:
+    """
+    Maps a user's reference lyric lines to the recognized word timestamps using fuzzy sequence alignment.
+    """
+    directives = parse_reference_lyrics_directives(ref_lines)
+    line_metas = directives["lines"]
+    no_words_ranges = directives["no_words_ranges"]
+    if not line_metas:
+        return []
+
+    ref_tokenized: List[List[str]] = []
+    active_metas: List[Dict[str, Any]] = []
+    flat_ref: List[Tuple[int, str, str]] = []  # (line_idx, raw_word, normalized_word)
+
+    for meta in line_metas:
+        line_str = meta["sung_text"]
+        raw_tokens = [t for t in line_str.split() if t.strip()]
+        if not raw_tokens:
+            continue
+        # Merge standalone punctuation tokens (e.g. "—", "-", "...") to the preceding word
+        tokens: List[str] = []
+        for t in raw_tokens:
+            if re.sub(r"[^\wа-яёa-z]", "", t.replace("=", "").replace("\u00ad", "").lower()):
+                tokens.append(t)
+            elif tokens:
+                tokens[-1] += f" {t}"
+            else:
+                tokens.append(t)
+        if not tokens:
+            continue
+        ref_tokenized.append(tokens)
+        active_metas.append(meta)
+        actual_l_idx = len(ref_tokenized) - 1
+        for t in tokens:
+            clean_t = t.replace("=", "").replace("\u00ad", "")
+            norm = _normalize_word(clean_t)
+            flat_ref.append((actual_l_idx, t, norm))
+
+    if not flat_ref or not recognized_words:
+        return []
+
+    rms, hop_s = compute_vocal_rms_envelope(vocals_path)
+
+    # Mask out "no words here" zones from recognized_words and RMS envelope
+    if no_words_ranges:
+        filtered_rw: List[Dict[str, Any]] = []
+        for rw in recognized_words:
+            mid_t = 0.5 * (float(rw.get("start", 0.0)) + float(rw.get("end", 0.0)))
+            if any(nw_s <= mid_t <= nw_e for nw_s, nw_e in no_words_ranges):
+                continue
+            filtered_rw.append(rw)
+        if filtered_rw:
+            recognized_words = filtered_rw
+        if rms is not None and len(rms) > 0:
+            rms = rms.copy()
+            for nw_s, nw_e in no_words_ranges:
+                i0 = max(0, int(nw_s / hop_s))
+                i1 = min(len(rms), int(nw_e / hop_s))
+                if i1 > i0:
+                    rms[i0:i1] = 0.0
+
+    recognized_words = _expand_recognized_words_for_ref(
+        recognized_words,
+        [item[2] for item in flat_ref],
+        [item[1].replace("=", "").replace("\u00ad", "") for item in flat_ref],
+    )
     rec_norms = [_normalize_word(w["text"]) for w in recognized_words]
     ref_norms = [item[2] for item in flat_ref]
 
     ref_to_time: List[Optional[Tuple[float, float]]] = [None] * len(flat_ref)
 
-    for tag, i1, i2, j1, j2 in _sequence_opcodes(ref_norms, rec_norms, recognized_words):
-        if tag == "equal":
-            for offset in range(i2 - i1):
-                rw = recognized_words[j1 + offset]
-                s_val, e_val = rw["start"], rw["end"]
-                ref_w = flat_ref[i1 + offset][1].strip()
-                if rms is not None and len(rms) > 0:
-                    dur_w = e_val - s_val
-                    has_punct = bool(ref_w and ref_w[-1] in ",.!?;:—…-")
-                    if (has_punct and dur_w > 0.45) or dur_w > max(0.65, count_syllables(ref_w) * 0.45):
-                        real_off = find_vocal_offset(rms, hop_s, s_val, e_val, min_silence_s=0.15)
-                        if real_off < e_val - 0.18:
-                            e_val = round(real_off, 2)
-                ref_to_time[i1 + offset] = (s_val, e_val)
-        elif tag == "replace" and (j2 > j1) and (i2 > i1):
-            win_start = recognized_words[j1]["start"]
-            win_end = recognized_words[j2 - 1]["end"]
-            sylls = [count_syllables(flat_ref[k][1]) for k in range(i1, i2)]
-            tot_syll = max(1, sum(sylls))
-            dur = win_end - win_start
-            if dur < 0.06 * (i2 - i1):
-                if strict_repeats:
-                    raise TimingAlignmentError("В готовом тексте есть лишние повторы или слишком много слов для распознанного интервала.")
-                dur = max(dur, 0.06 * (i2 - i1))
-                win_end = max(win_end, win_start + dur)
-            # Bound replacement duration to prevent smearing across omitted audio sections
-            max_natural_dur = tot_syll * 0.85
-            if dur > max_natural_dur:
-                win_end = win_start + max_natural_dur
+    has_pegs = any(m.get("peg_start") is not None for m in active_metas)
+    if has_pegs:
+        # Corridor-constrained alignment between sparse LRC pegs
+        line_word_spans: Dict[int, Tuple[int, int]] = {}
+        for k, (l_i, _, _) in enumerate(flat_ref):
+            if l_i not in line_word_spans:
+                line_word_spans[l_i] = (k, k + 1)
+            else:
+                line_word_spans[l_i] = (line_word_spans[l_i][0], k + 1)
+
+        peg_indices = [i for i, m in enumerate(active_metas) if m.get("peg_start") is not None]
+        # Build segments of lines separated by pegged lines
+        boundaries: List[Tuple[int, int, float, float]] = []
+        total_audio_end = max(
+            float(recognized_words[-1]["end"]),
+            len(rms) * hop_s if rms is not None and len(rms) > 0 else 0.0,
+        )
+        prev_l = 0
+        prev_t = 0.0
+        for p_idx in peg_indices:
+            p_s = float(active_metas[p_idx]["peg_start"])
+            if p_idx > prev_l:
+                boundaries.append((prev_l, p_idx, prev_t, p_s))
+            p_e = active_metas[p_idx].get("peg_end")
+            if p_e is not None:
+                ws_i, we_i = line_word_spans[p_idx]
+                seg_words = [{"text": flat_ref[k][1], "start": p_s, "end": float(p_e)} for k in range(ws_i, we_i)]
+                dist_seg = _distribute_words_by_vocal_valleys(seg_words, p_s, float(p_e), rms, hop_s)
+                for off, dw in enumerate(dist_seg):
+                    ref_to_time[ws_i + off] = (float(dw["start"]), float(dw["end"]))
+                prev_l = p_idx + 1
+                prev_t = float(p_e)
+            else:
+                prev_l = p_idx
+                prev_t = p_s
+        if prev_l < len(active_metas):
+            boundaries.append((prev_l, len(active_metas), prev_t, total_audio_end))
+
+        for seg_l0, seg_l1, t_lo, t_hi in boundaries:
+            w_i0 = line_word_spans[seg_l0][0]
+            w_i1 = line_word_spans[seg_l1 - 1][1]
+            seg_rec = [
+                rw for rw in recognized_words
+                if float(rw["end"]) >= t_lo - 0.50 and float(rw["start"]) <= t_hi + 0.50
+            ]
+            if not seg_rec:
+                continue
+            seg_rec_norms = [_normalize_word(w["text"]) for w in seg_rec]
+            seg_ref_norms = ref_norms[w_i0:w_i1]
+            for tag, i1, i2, j1, j2 in _sequence_opcodes(seg_ref_norms, seg_rec_norms, seg_rec):
+                if tag == "equal":
+                    for offset in range(i2 - i1):
+                        rw = seg_rec[j1 + offset]
+                        ref_to_time[w_i0 + i1 + offset] = (rw["start"], rw["end"])
+                elif tag == "replace" and (j2 > j1) and (i2 > i1):
+                    ws = float(seg_rec[j1]["start"])
+                    we = float(seg_rec[j2 - 1]["end"])
+                    sylls = [count_syllables(flat_ref[w_i0 + k][1]) for k in range(i1, i2)]
+                    tot_s = max(1, sum(sylls))
+                    dur = min(tot_s * 0.85, max(0.06 * (i2 - i1), we - ws))
+                    cur = ws
+                    for idx_k, k in enumerate(range(i1, i2)):
+                        step = dur * (sylls[idx_k] / tot_s)
+                        ref_to_time[w_i0 + k] = (round(cur, 2), round(cur + step, 2))
+                        cur += step
+            # Ensure pegged line's first word starts near peg_start if unaligned
+            if active_metas[seg_l0].get("peg_start") is not None and ref_to_time[w_i0] is None:
+                ps_t = float(active_metas[seg_l0]["peg_start"])
+                ref_to_time[w_i0] = (round(ps_t, 2), round(ps_t + 0.25, 2))
+    else:
+        for tag, i1, i2, j1, j2 in _sequence_opcodes(ref_norms, rec_norms, recognized_words):
+            if tag == "equal":
+                for offset in range(i2 - i1):
+                    rw = recognized_words[j1 + offset]
+                    ref_to_time[i1 + offset] = (rw["start"], rw["end"])
+            elif tag == "replace" and (j2 > j1) and (i2 > i1):
+                win_start = recognized_words[j1]["start"]
+                win_end = recognized_words[j2 - 1]["end"]
+                sylls = [count_syllables(flat_ref[k][1]) for k in range(i1, i2)]
+                tot_syll = max(1, sum(sylls))
                 dur = win_end - win_start
-            cur = win_start
-            for idx_k, k in enumerate(range(i1, i2)):
-                step = dur * (sylls[idx_k] / tot_syll)
-                ref_to_time[k] = (round(cur, 2), round(cur + step, 2))
-                cur += step
+                if dur < 0.06 * (i2 - i1):
+                    if strict_repeats:
+                        raise TimingAlignmentError("В готовом тексте есть лишние повторы или слишком много слов для распознанного интервала.")
+                    dur = max(dur, 0.06 * (i2 - i1))
+                    win_end = max(win_end, win_start + dur)
+                # Bound replacement duration to prevent smearing across omitted audio sections
+                max_natural_dur = tot_syll * 0.85
+                if dur > max_natural_dur:
+                    win_end = win_start + max_natural_dur
+                    dur = win_end - win_start
+                cur = win_start
+                for idx_k, k in enumerate(range(i1, i2)):
+                    step = dur * (sylls[idx_k] / tot_syll)
+                    ref_to_time[k] = (round(cur, 2), round(cur + step, 2))
+                    cur += step
 
     # Density & Sanity Guard: reject spurious short anchors (<= 2 words) that force impossible compression (< 0.12s/word)
     k = 0
@@ -1613,7 +2200,7 @@ def align_words_to_reference_lines(
             left_l = flat_ref[idx - 1][0] if has_left else None
 
             # Guard against stretching words across instrumental pauses
-            max_natural_dur = max(0.35, tot_s * 0.55)
+            max_natural_dur = 0.60 if tot_s == 1 else max(0.45, tot_s * 0.75)
             if dur > max_natural_dur:
                 # If vocals envelope is available, detect actual vocal activity within the gap
                 if rms is not None and len(rms) > 0 and dur > 1.8:
@@ -1689,12 +2276,48 @@ def align_words_to_reference_lines(
     grouped_lines: List[List[Dict[str, Any]]] = [[] for _ in range(len(ref_tokenized))]
     for k, (l_idx, raw_word, _) in enumerate(flat_ref):
         s_t, e_t = ref_to_time[k]
-        grouped_lines[l_idx].append({
+        w_dict: Dict[str, Any] = {
             "text": raw_word,
             "start": s_t,
             "end": e_t,
             "syllables": count_syllables(raw_word),
-        })
+        }
+        if active_metas[l_idx].get("voice") == 2:
+            w_dict["voice"] = 2
+        grouped_lines[l_idx].append(w_dict)
+
+    # Apply `shown_text` ("sung | shown") and strip explicit syllable markers (`=` / `\u00ad`)
+    for l_idx, line in enumerate(grouped_lines):
+        if not line:
+            continue
+        shown = active_metas[l_idx].get("shown_text")
+        if shown:
+            shown_tokens = [t for t in shown.split() if t.strip()]
+            if len(shown_tokens) == len(line):
+                for w_d, st_tok in zip(line, shown_tokens):
+                    w_d["text"] = st_tok
+            else:
+                merged_w: Dict[str, Any] = {
+                    "text": shown,
+                    "start": line[0]["start"],
+                    "end": line[-1]["end"],
+                    "syllables": count_syllables(shown),
+                }
+                if line[0].get("voice") == 2:
+                    merged_w["voice"] = 2
+                grouped_lines[l_idx] = [merged_w]
+                continue
+        for w_d in line:
+            if "=" in w_d["text"] or "\u00ad" in w_d["text"]:
+                explicit_syls = split_word_into_syllables(w_d["text"])
+                if len(explicit_syls) > 1:
+                    w_d["syllables"] = len(explicit_syls)
+                    w_d["syllable_timings"] = estimate_acoustic_syllable_timings(
+                        w_d["text"], float(w_d["start"]), float(w_d["end"]), rms, hop_s
+                    )
+                    for st_item in w_d["syllable_timings"]:
+                        st_item["text"] = st_item["text"].replace("=", "").replace("\u00ad", "")
+                w_d["text"] = w_d["text"].replace("=", "").replace("\u00ad", "")
 
     # Outlier Word Guard: if the first or last word of a line is detached by >2.0s
     # from the main phrase cluster, pull it to the phrase cluster so stray short words ("Ты", "Я")
@@ -1717,10 +2340,7 @@ def align_words_to_reference_lines(
 
     result = [line for line in grouped_lines if line]
 
-    if vocals_path and Path(vocals_path).exists() and result:
-        import copy
-        from karaoke.alignment_qa import optimize_alignment_to_target
-
+    if result:
         flat_base = [w for line in result for w in line]
         _rebalance_squashed_words(flat_base)
         if rms is not None and len(rms) > 0:
@@ -1729,33 +2349,6 @@ def align_words_to_reference_lines(
                     w["syllable_timings"] = estimate_acoustic_syllable_timings(
                         w["text"], w["start"], w["end"], rms, hop_s
                     )
-
-        ctc_candidate = None
-        if use_ctc_align:
-            ctc_candidate = copy.deepcopy(result)
-            flat_ctc = [w for line in ctc_candidate for w in line]
-            line_ends: set = set()
-            cursor_idx = 0
-            for ln in ctc_candidate:
-                if ln:
-                    cursor_idx += len(ln)
-                    line_ends.add(cursor_idx - 1)
-            forced_align_words_ctc(flat_ctc, vocals_path=vocals_path, line_end_indices=line_ends)
-            prev_e = first_vocal_onset if first_vocal_onset is not None else 0.0
-            for w in flat_ctc:
-                if float(w["start"]) < prev_e:
-                    w["start"] = round(prev_e, 2)
-                if float(w["end"]) <= float(w["start"]):
-                    w["end"] = round(float(w["start"]) + 0.08, 2)
-                prev_e = float(w["end"])
-            _rebalance_squashed_words(flat_ctc)
-
-        result, _ = optimize_alignment_to_target(
-            result,
-            vocals_path=vocals_path,
-            ctc_lines=ctc_candidate,
-            target_score=90.0,
-        )
 
     validate_karaoke_lines(result)
     return result
@@ -2388,6 +2981,9 @@ def refine_unaligned_vocal_slices(
                         text=prompt_txt,
                         mode="whisper",
                         work_dir=target_dir,
+                        vocals_path=vocals_path,
+                        model_size=whisper_model,
+                        allow_rms_fallback=False,
                     )
                     if slice_words:
                         discovered_words.extend(slice_words)
@@ -2487,27 +3083,320 @@ def _distribute_words_by_vocal_valleys(
     return cand
 
 
+def _find_vocal_islands(
+    rms: Optional[np.ndarray],
+    hop_s: float,
+    t_start: float,
+    t_end: float,
+    min_gap_s: float = 0.35,
+    min_island_s: float = 0.25,
+) -> List[Tuple[float, float]]:
+    """Detects distinct vocal phrase islands (onset, offset) inside [t_start, t_end] from RMS envelope."""
+    if rms is None or len(rms) == 0 or t_end <= t_start + 0.15:
+        return []
+    i_s = max(0, int(t_start / hop_s))
+    i_e = min(len(rms), int(t_end / hop_s))
+    if i_e <= i_s:
+        return []
+    win = rms[i_s:i_e]
+    p90 = float(np.percentile(win, 90)) if len(win) > 0 else 0.0
+    if p90 < 0.01:
+        return []
+    thresh = max(0.010, p90 * 0.14)
+    active = win > thresh
+
+    raw_islands: List[Tuple[int, int]] = []
+    in_seg = False
+    seg_s = 0
+    for k, val in enumerate(active):
+        if val and not in_seg:
+            in_seg = True
+            seg_s = k
+        elif not val and in_seg:
+            in_seg = False
+            raw_islands.append((seg_s, k))
+    if in_seg:
+        raw_islands.append((seg_s, len(active)))
+
+    if not raw_islands:
+        return []
+
+    min_gap_frames = max(1, int(min_gap_s / hop_s))
+    merged: List[Tuple[int, int]] = [raw_islands[0]]
+    for s_idx, e_idx in raw_islands[1:]:
+        prev_s, prev_e = merged[-1]
+        if s_idx - prev_e <= min_gap_frames:
+            merged[-1] = (prev_s, e_idx)
+        else:
+            merged.append((s_idx, e_idx))
+
+    min_len_frames = max(1, int(min_island_s / hop_s))
+    return [
+        (round((i_s + s_idx) * hop_s, 2), round((i_s + e_idx) * hop_s, 2))
+        for s_idx, e_idx in merged
+        if (e_idx - s_idx) >= min_len_frames
+    ]
+
+
+def _stretch_bad_runs_to_vocals(
+    out: List[List[Dict[str, Any]]],
+    bad_indices: List[int],
+    locked_set: set,
+    rms: Optional[np.ndarray],
+    hop_s: float,
+) -> Dict[int, Tuple[float, float]]:
+    """
+    For lines marked as bad (👎), computes stretched [win_start, win_end] windows inside the
+    acoustic corridor between neighboring non-bad/locked lines using vocal RMS islands.
+    """
+    windows: Dict[int, Tuple[float, float]] = {}
+    if not bad_indices or rms is None or len(rms) == 0:
+        return windows
+
+    audio_end = round(len(rms) * hop_s, 2)
+    sorted_bad = sorted(i for i in bad_indices if i not in locked_set and 0 <= i < len(out) and out[i])
+    if not sorted_bad:
+        return windows
+
+    # Group contiguous bad line indices into runs
+    runs: List[List[int]] = []
+    for idx in sorted_bad:
+        if not runs or idx != runs[-1][-1] + 1:
+            runs.append([idx])
+        else:
+            runs[-1].append(idx)
+
+    for run in runs:
+        r_s, r_e = run[0], run[-1]
+        corr_start = round(float(out[r_s - 1][-1]["end"]) + 0.02, 2) if r_s > 0 and out[r_s - 1] else 0.0
+        if r_e + 1 < len(out) and out[r_e + 1]:
+            corr_end = round(float(out[r_e + 1][0]["start"]) - 0.02, 2)
+        else:
+            last_end = float(out[r_e][-1]["end"])
+            corr_end = min(audio_end, round(last_end + 18.0, 2))
+
+        if corr_end <= corr_start + 0.25:
+            continue
+
+        islands = _find_vocal_islands(rms, hop_s, corr_start, corr_end, min_gap_s=0.38, min_island_s=0.35)
+        if not islands:
+            continue
+
+        n_run = len(run)
+        if n_run == 1:
+            idx = run[0]
+            orig_s = float(out[idx][0]["start"])
+            orig_e = float(out[idx][-1]["end"])
+            # Pick islands overlapping original line or main vocal energy in corridor
+            overlapping = [isl for isl in islands if isl[1] >= orig_s - 0.5 and isl[0] <= corr_end]
+            chosen = overlapping if overlapping else islands
+            if len(chosen) == 1:
+                windows[idx] = (max(corr_start, chosen[0][0]), min(corr_end, chosen[0][1]))
+            else:
+                # Expand to cover the primary island containing orig_s, plus close continuations (< 1.2s gap)
+                base_isl = min(chosen, key=lambda x: abs((x[0] + x[1]) * 0.5 - (orig_s + orig_e) * 0.5))
+                w_s, w_e = base_isl
+                for isl in chosen:
+                    if isl[0] > w_e and isl[0] - w_e <= 1.2:
+                        w_e = isl[1]
+                windows[idx] = (max(corr_start, w_s), min(corr_end, w_e))
+            continue
+
+        if len(islands) == n_run:
+            for idx, (is_s, is_e) in zip(run, islands):
+                windows[idx] = (max(corr_start, is_s), min(corr_end, is_e))
+        elif len(islands) > n_run:
+            # Select the n_run strongest/longest islands in chronological order
+            scored = sorted(
+                enumerate(islands),
+                key=lambda item: (item[1][1] - item[1][0]),
+                reverse=True,
+            )[:n_run]
+            picked = [islands[i] for i, _ in sorted(scored, key=lambda x: x[0])]
+            for idx, (is_s, is_e) in zip(run, picked):
+                windows[idx] = (max(corr_start, is_s), min(corr_end, is_e))
+        else:
+            # Fewer islands than lines (continuous singing across consecutive lines):
+            # distribute lines proportionally by syllable count across active vocal span
+            active_s = max(corr_start, islands[0][0])
+            active_e = min(corr_end, islands[-1][1])
+            if active_e <= active_s + 0.15 * n_run:
+                continue
+            line_sylls = [max(1, sum(count_syllables(w["text"]) for w in out[i])) for i in run]
+            tot_sylls = max(1, sum(line_sylls))
+            span = active_e - active_s
+            cur_t = active_s
+            for k, idx in enumerate(run):
+                if k == n_run - 1:
+                    end_t = active_e
+                else:
+                    target_end = cur_t + span * (line_sylls[k] / tot_sylls)
+                    # Snap split to local RMS valley within +-0.25s
+                    lo = max(cur_t + 0.15, target_end - 0.25)
+                    hi = min(active_e - 0.15 * (n_run - 1 - k), target_end + 0.25)
+                    end_t = target_end
+                    if hi > lo + hop_s:
+                        i_lo = max(0, int(lo / hop_s))
+                        i_hi = min(len(rms) - 1, int(hi / hop_s))
+                        if i_hi > i_lo:
+                            end_t = (i_lo + int(np.argmin(rms[i_lo:i_hi + 1]))) * hop_s
+                windows[idx] = (round(cur_t, 2), round(max(cur_t + 0.15, end_t), 2))
+                cur_t = windows[idx][1]
+
+    return windows
+
+
+def _ctc_syllable_timings_for_word(
+    cw: Dict[str, Any],
+    ctc_model: Any,
+    vocab: Dict[str, int],
+    blank_id: int,
+    waveform: Any,
+    sr: int,
+    device: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """Runs MMS_FA CTC strictly inside a single word's [start, end] to obtain syllable onsets."""
+    sylls = split_word_into_syllables(cw["text"])
+    if len(sylls) <= 1 or ctc_model is None or waveform is None:
+        return None
+    try:
+        import torch
+        import torchaudio
+
+        token_ids: List[int] = []
+        token_meta: List[int] = []
+        for s_i, tids in _word_syllables_to_mms_tokens(cw["text"], vocab):
+            if not tids:
+                return None
+            for tid in tids:
+                token_ids.append(tid)
+                token_meta.append(s_i)
+        w_s, w_e = float(cw["start"]), float(cw["end"])
+        s_sample = max(0, int(w_s * sr))
+        e_sample = min(waveform.shape[1], int(w_e * sr))
+        if not token_ids or e_sample - s_sample < int(0.12 * sr):
+            return None
+        seg = waveform[:, s_sample:e_sample].to(device)
+        with torch.no_grad():
+            emissions, _ = ctc_model(seg)
+            log_probs = torch.log_softmax(emissions, dim=-1).cpu()
+        num_frames = log_probs.shape[1]
+        if num_frames <= len(token_ids):
+            return None
+        targets = torch.tensor([token_ids], dtype=torch.int32)
+        aligned_tokens, scores = torchaudio.functional.forced_align(log_probs, targets, blank=blank_id)
+        spans = torchaudio.functional.merge_tokens(aligned_tokens[0], scores[0], blank=blank_id)
+        if len(spans) != len(token_ids):
+            return None
+        frame_dur = (e_sample - s_sample) / sr / num_frames
+        syl_onsets: Dict[int, float] = {}
+        for span, s_i in zip(spans, token_meta):
+            syl_onsets.setdefault(s_i, w_s + span.start * frame_dur)
+        onsets = [syl_onsets.get(k) for k in range(len(sylls))]
+        if all(o is None or (w_s - 0.03 <= o <= w_e + 0.03) for o in onsets):
+            return _build_syllable_timings_from_onsets(sylls, onsets, w_s, w_e)
+    except Exception:
+        return None
+    return None
+
+
+def _build_whisper_anchored_line(
+    ln: List[Dict[str, Any]],
+    w_matches: Dict[int, Tuple[float, float]],
+    win_start: float,
+    win_end: float,
+    rms: Optional[np.ndarray],
+    hop_s: float,
+) -> List[Dict[str, Any]]:
+    """
+    Constructs word timings anchored to matched Whisper words inside [win_start, win_end],
+    interpolating unmatched gaps proportionally by syllable count and vocal RMS valleys.
+    """
+    import copy
+
+    cand = copy.deepcopy(ln)
+    n = len(cand)
+    slots: List[Optional[Tuple[float, float]]] = [None] * n
+    for i in range(n):
+        if i in w_matches:
+            rs, re_t = w_matches[i]
+            # Expand collapsed final multi-syllable Whisper word up to win_end
+            if i == n - 1 and (re_t - rs < 0.25 or win_end - re_t <= 0.45):
+                re_t = max(re_t, win_end)
+            slots[i] = (max(win_start, rs), min(win_end, max(rs + 0.08, re_t)))
+
+    # Interpolate any None runs between anchored slots
+    i = 0
+    while i < n:
+        if slots[i] is None:
+            j = i
+            while j + 1 < n and slots[j + 1] is None:
+                j += 1
+            left_t = slots[i - 1][1] if i > 0 and slots[i - 1] is not None else win_start
+            right_t = slots[j + 1][0] if j + 1 < n and slots[j + 1] is not None else win_end
+            if right_t - left_t < 0.08 * (j - i + 1):
+                right_t = min(win_end, left_t + 0.08 * (j - i + 1))
+            seg = _distribute_words_by_vocal_valleys(cand[i : j + 1], left_t, right_t, rms, hop_s)
+            for off, sw in enumerate(seg):
+                slots[i + off] = (float(sw["start"]), float(sw["end"]))
+            i = j + 1
+        else:
+            i += 1
+
+    cursor = win_start
+    for idx_w, cw in enumerate(cand):
+        ws, we = slots[idx_w]  # type: ignore[misc]
+        ws = max(cursor, ws)
+        if idx_w == 0:
+            ws = min(ws, win_start) if abs(ws - win_start) <= 0.15 else ws
+        we = max(ws + 0.08, min(win_end, we))
+        cw["start"] = round(ws, 2)
+        cw["end"] = round(we, 2)
+        cursor = cw["end"]
+
+    if cand:
+        cand[0]["start"] = round(min(float(cand[0]["start"]), win_start) if abs(float(cand[0]["start"]) - win_start) <= 0.20 else float(cand[0]["start"]), 2)
+        cand[-1]["end"] = round(max(float(cand[-1]["start"]) + 0.08, win_end), 2)
+
+    _clamp_proclitics_and_short_onsets(cand, rms, hop_s, prev_end=win_start)
+    _rebalance_squashed_words(cand)
+    return cand
+
+
 def realign_lines_by_vocals(
     lines: List[List[Dict[str, Any]]],
     vocals_path: Optional[Path],
     target_indices: Optional[List[int]] = None,
+    bad_indices: Optional[Any] = None,
+    locked_indices: Optional[Any] = None,
+    recognized_words: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[List[Dict[str, Any]]], List[int]]:
     """
     Re-runs vocal forced alignment (MMS_FA CTC + acoustic syllable timing) strictly on the
-    specified `target_indices` lines, keeping each line inside its user-defined [start, end]
-    window so manual block boundaries are respected while internal words & syllables snap to vocals.
+    specified `target_indices` lines.
+    - Manually adjusted lines keep their user-defined [start, end] window.
+    - Lines marked as bad (👎 in `bad_indices`) are stretched/re-anchored onto real vocal
+      phrase islands inside the corridor between neighboring good/locked lines.
     """
     import copy
 
     if not lines or not target_indices:
         return lines, []
 
-    valid_indices = sorted({i for i in target_indices if 0 <= i < len(lines) and lines[i]})
+    locked_set = set(locked_indices or [])
+    bad_set = set(bad_indices or []) - locked_set
+    valid_indices = sorted({
+        i for i in target_indices
+        if 0 <= i < len(lines) and lines[i] and i not in locked_set
+    })
     if not valid_indices:
         return lines, []
 
     out = copy.deepcopy(lines)
     rms, hop_s = compute_vocal_rms_envelope(vocals_path)
+    bad_windows = _stretch_bad_runs_to_vocals(
+        out, [i for i in valid_indices if i in bad_set], locked_set, rms, hop_s
+    )
     updated: List[int] = []
 
     ctc_ready = False
@@ -2547,24 +3436,62 @@ def realign_lines_by_vocals(
     try:
         for idx in valid_indices:
             ln = out[idx]
-            win_start = round(max(0.0, float(ln[0]["start"])), 2)
-            win_end = round(max(win_start + 0.15, float(ln[-1]["end"])), 2)
+            if idx in bad_windows:
+                win_start, win_end = bad_windows[idx]
+            else:
+                win_start = round(max(0.0, float(ln[0]["start"])), 2)
+                win_end = round(max(win_start + 0.15, float(ln[-1]["end"])), 2)
 
-            # Honor user-defined [win_start, win_end] by trimming overlapping neighbours
+            # Honor [win_start, win_end] by trimming overlapping neighbours (never trim locked lines)
             if idx > 0 and out[idx - 1] and float(out[idx - 1][-1]["end"]) > win_start:
                 prev_s = float(out[idx - 1][0]["start"])
-                if win_start - prev_s >= 0.08 * len(out[idx - 1]):
+                if (idx - 1) not in locked_set and win_start - prev_s >= 0.08 * len(out[idx - 1]):
                     _scale_line_into_window(out[idx - 1], prev_s, win_start)
                 else:
                     win_start = round(float(out[idx - 1][-1]["end"]), 2)
-            if idx + 1 < len(out) and out[idx + 1] and float(out[idx + 1][0]["start"]) < win_end:
-                nxt_e = float(out[idx + 1][-1]["end"])
-                if nxt_e - win_end >= 0.08 * len(out[idx + 1]):
-                    _scale_line_into_window(out[idx + 1], win_end, nxt_e)
-                else:
-                    win_end = round(float(out[idx + 1][0]["start"]), 2)
+            if idx + 1 < len(out) and out[idx + 1]:
+                nxt_s_ref = bad_windows[idx + 1][0] if (idx + 1) in bad_windows else float(out[idx + 1][0]["start"])
+                if nxt_s_ref < win_end:
+                    if (idx + 1) in bad_windows or (idx + 1) in locked_set:
+                        win_end = round(nxt_s_ref, 2)
+                    else:
+                        nxt_e = float(out[idx + 1][-1]["end"])
+                        if nxt_e - win_end >= 0.08 * len(out[idx + 1]):
+                            _scale_line_into_window(out[idx + 1], win_end, nxt_e)
+                        else:
+                            win_end = round(nxt_s_ref, 2)
 
             if win_end <= win_start + 0.12:
+                continue
+
+            # When Whisper recognized >= half of the line's words inside the window, anchor word
+            # boundaries to Whisper and run CTC strictly per-word for syllable timings so CTC
+            # cannot smear one word across the next word's vocal onset.
+            w_matches = (
+                _match_line_words_to_whisper(ln, recognized_words, win_start, win_end)
+                if recognized_words
+                else {}
+            )
+            if len(w_matches) >= max(2, (len(ln) + 1) // 2):
+                cand = _build_whisper_anchored_line(ln, w_matches, win_start, win_end, rms, hop_s)
+                for cw in cand:
+                    sylls = split_word_into_syllables(cw["text"])
+                    if len(sylls) <= 1:
+                        cw.pop("syllable_timings", None)
+                        continue
+                    ctc_st = (
+                        _ctc_syllable_timings_for_word(cw, ctc_model, vocab, blank_id, waveform, sr, device)
+                        if ctc_ready
+                        else None
+                    )
+                    if ctc_st is not None:
+                        cw["syllable_timings"] = ctc_st
+                    elif rms is not None and len(rms) > 0:
+                        cw["syllable_timings"] = estimate_acoustic_syllable_timings(
+                            cw["text"], float(cw["start"]), float(cw["end"]), rms, hop_s
+                        )
+                out[idx] = cand
+                updated.append(idx)
                 continue
 
             did_ctc = False
@@ -2624,6 +3551,7 @@ def realign_lines_by_vocals(
                                     # Keep user-defined outer bounds and prevent collapsed/squashed CTC words
                                     cand[0]["start"] = round(win_start, 2)
                                     cand[-1]["end"] = round(win_end, 2)
+                                    _clamp_proclitics_and_short_onsets(cand, rms, hop_s, prev_end=win_start)
                                     _rebalance_squashed_words(cand)
                                     total_span = max(0.08 * len(cand), win_end - win_start)
                                     syll_counts = [max(1, count_syllables(cw["text"])) for cw in cand]
@@ -2656,6 +3584,7 @@ def realign_lines_by_vocals(
 
             if not did_ctc:
                 cand = _distribute_words_by_vocal_valleys(ln, win_start, win_end, rms, hop_s)
+                _clamp_proclitics_and_short_onsets(cand, rms, hop_s, prev_end=win_start)
                 if rms is not None and len(rms) > 0:
                     for cw in cand:
                         cw["syllable_timings"] = estimate_acoustic_syllable_timings(

@@ -56,6 +56,15 @@ export interface AlignmentReport {
   changed_bad_lines?: number[]
   unchanged_bad_lines?: number[]
   anchor_repaired_lines?: number[]
+  iterations_history?: Array<{
+    iter: number
+    overall_score: number
+    onset_score: number
+    coverage_score: number
+    hang_score: number
+    tempo_score: number
+    improved_lines: number
+  }>
   problem_lines?: Array<{
     line_idx: number
     score: number

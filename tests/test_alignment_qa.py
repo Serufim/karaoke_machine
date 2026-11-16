@@ -351,4 +351,179 @@ def test_realign_lines_by_vocals_preserves_stretched_bounds_and_trims_overlap(tm
         assert (w["end"] - w["start"]) >= 0.25
 
 
+def test_expand_recognized_words_splits_hyphenated_and_compound_words():
+    from karaoke.aligner import align_words_to_reference_lines
+
+    rec_words = [
+        {"text": "На", "start": 1.0, "end": 1.2},
+        {"text": "Граустрите", "start": 1.2, "end": 2.2},
+        {"text": "в", "start": 2.2, "end": 2.3},
+        {"text": "Лос-Сантос", "start": 2.3, "end": 3.3},
+    ]
+    lines = align_words_to_reference_lines(
+        rec_words,
+        ["На Гроув Стрите в Лос Сантос"],
+        vocals_path=None,
+    )
+    assert len(lines) == 1
+    words = lines[0]
+    assert [w["text"] for w in words] == ["На", "Гроув", "Стрите", "в", "Лос", "Сантос"]
+    # Compound "Граустрите" (1.2-2.2) splits into Гроув + Стрите without crushing either
+    assert 1.15 <= words[1]["start"] <= 1.25
+    assert words[1]["end"] - words[1]["start"] >= 0.25
+    assert words[2]["end"] - words[2]["start"] >= 0.40
+    # Hyphenated "Лос-Сантос" (2.3-3.3) splits cleanly into Лос + Сантос
+    assert 2.25 <= words[4]["start"] <= 2.35
+    assert words[4]["end"] - words[4]["start"] >= 0.25
+    assert words[5]["end"] >= 3.25
+
+
+def test_realign_lines_by_vocals_anchors_whisper_words_and_clamps_proclitics(tmp_path):
+    from karaoke.aligner import realign_lines_by_vocals
+
+    vocals = tmp_path / "vocals.wav"
+    _write_synthetic_vocals(vocals, duration_s=8.0, active_ranges=[(1.0, 5.2)])
+
+    # Line has smeared words (в stretched to 0.45s, много stretched to 1.2s)
+    lines = [[
+        {"text": "Так", "start": 1.0, "end": 1.25},
+        {"text": "много", "start": 1.25, "end": 2.65},
+        {"text": "в", "start": 2.65, "end": 3.15},
+        {"text": "городе", "start": 3.15, "end": 5.2},
+    ]]
+    rec_words = [
+        {"text": "Так", "start": 1.0, "end": 1.20},
+        {"text": "много", "start": 1.20, "end": 1.75},
+        {"text": "в", "start": 2.95, "end": 3.10},
+        {"text": "городе", "start": 3.10, "end": 5.15},
+    ]
+    out_lines, updated = realign_lines_by_vocals(
+        lines, vocals, [0], recognized_words=rec_words
+    )
+    assert 0 in updated
+    w_out = out_lines[0]
+    # Matched Whisper anchor for "много" keeps it near [1.20, 1.75] instead of 1.2s smear
+    assert abs(w_out[1]["end"] - 1.75) <= 0.15
+    # Vowelless proclitic "в" is clamped <= 0.16s
+    assert (w_out[2]["end"] - w_out[2]["start"]) <= 0.16
+    # Syllable timings populated for multi-syllable words
+    assert len(w_out[3].get("syllable_timings", [])) == 3
+
+
+def test_optimize_alignment_to_target_99_tracks_history_and_fixes_proclitic(tmp_path):
+    from karaoke.alignment_qa import optimize_alignment_to_target
+
+    vocals = tmp_path / "vocals.wav"
+    _write_synthetic_vocals(vocals, duration_s=7.0, active_ranges=[(1.0, 4.5)])
+
+    lines = [[
+        {"text": "Вернуться", "start": 1.0, "end": 2.2},
+        {"text": "в", "start": 2.2, "end": 2.85},  # stretched proclitic (0.65s!)
+        {"text": "городок", "start": 2.85, "end": 4.5},
+    ]]
+    opt, report = optimize_alignment_to_target(lines, vocals, target_score=99.0, max_iters=6)
+    assert "iterations_history" in report
+    assert len(report["iterations_history"]) >= 1
+    # Proclitic "в" should be clamped <= 0.16s and score should improve
+    assert (opt[0][1]["end"] - opt[0][1]["start"]) <= 0.16
+    assert report["overall_score"] >= 95.0
+
+
+def test_parse_reference_lyrics_directives_pegs_repeats_voices_and_shown():
+    from karaoke.aligner import parse_reference_lyrics_directives
+
+    raw = """
+    [Соло 0:00-0:15]
+    [0:16.50] Первая строка
+    Припев x3
+    2: Бэк вокал строка
+    [voice 2]
+    Второй голос
+    [voice 1]
+    Натуральные числа | ℕ
+    фо=то=гра=фи=я
+    """
+    res = parse_reference_lyrics_directives(raw)
+    assert res["no_words_ranges"] == [(0.0, 15.0)]
+    lines = res["lines"]
+    assert lines[0]["sung_text"] == "Первая строка"
+    assert lines[0]["peg_start"] == 16.5
+    assert [l["sung_text"] for l in lines[1:4]] == ["Припев", "Припев", "Припев"]
+    assert lines[4]["voice"] == 2 and lines[4]["sung_text"] == "Бэк вокал строка"
+    assert lines[5]["voice"] == 2 and lines[5]["sung_text"] == "Второй голос"
+    assert lines[6]["voice"] == 1 and lines[6]["sung_text"] == "Натуральные числа" and lines[6]["shown_text"] == "ℕ"
+    assert lines[7]["sung_text"] == "фо=то=гра=фи=я"
+
+
+def test_align_words_respects_sparse_pegs_and_no_words_zones():
+    from karaoke.aligner import align_words_to_reference_lines
+
+    rec_words = [
+        {"text": "ааа", "start": 2.0, "end": 4.0},   # inside [no words 0:00-0:05]
+        {"text": "Первая", "start": 10.0, "end": 10.5},
+        {"text": "строка", "start": 10.5, "end": 11.2},
+        {"text": "Вторая", "start": 25.0, "end": 25.6},
+        {"text": "строка", "start": 25.6, "end": 26.3},
+    ]
+    ref = [
+        "[no words 0:00-0:05]",
+        "[0:10] Первая строка",
+        "[0:25] Вторая фо=то=гра=фи=я",
+    ]
+    lines = align_words_to_reference_lines(rec_words, ref, vocals_path=None)
+    assert len(lines) == 2
+    assert lines[0][0]["start"] >= 9.9
+    assert lines[1][0]["start"] >= 24.9
+    # Explicit syllable marker '=' stripped from final display text
+    assert lines[1][1]["text"] == "фотография"
+    assert lines[1][1]["syllables"] == 5
+
+
+def test_split_and_join_line_by_breath_pause():
+    from karaoke.aligner import split_line_by_breath_pause, join_with_next_line
+
+    lines = [[
+        {"text": "Раз", "start": 1.0, "end": 1.3},
+        {"text": "два", "start": 1.32, "end": 1.6},
+        {"text": "три", "start": 2.4, "end": 2.8},  # longest pause (0.8s) before "три"
+        {"text": "четыре", "start": 2.82, "end": 3.4},
+    ]]
+    split_lines = split_line_by_breath_pause(lines, 0)
+    assert len(split_lines) == 2
+    assert [w["text"] for w in split_lines[0]] == ["Раз", "два"]
+    assert [w["text"] for w in split_lines[1]] == ["три", "четыре"]
+
+    joined = join_with_next_line(split_lines, 0)
+    assert len(joined) == 1
+    assert [w["text"] for w in joined[0]] == ["Раз", "два", "три", "четыре"]
+
+
+def test_export_standalone_html_and_pitch_shift(tmp_path):
+    from karaoke.mixer import shift_pitch_wav
+    from karaoke.pro_exporter import export_standalone_html
+
+    vocals = tmp_path / "vocals.wav"
+    _write_synthetic_vocals(vocals, duration_s=3.0, active_ranges=[(0.5, 2.5)])
+
+    # Zero pitch shift returns source path directly
+    assert shift_pitch_wav(vocals, tmp_path / "out_0.wav", 0.0) == vocals
+
+    # +2 semitones pitch shift creates valid WAV
+    shifted = shift_pitch_wav(vocals, tmp_path / "out_p2.wav", 2.0)
+    assert shifted.exists() and shifted.stat().st_size > 1024
+
+    # Standalone HTML export embeds audio and lyrics
+    html_out = tmp_path / "demo_karaoke.html"
+    lines = [[
+        {"text": "Привет", "start": 0.5, "end": 1.2},
+        {"text": "мир", "start": 1.2, "end": 2.0, "voice": 2},
+    ]]
+    export_standalone_html(lines, vocals, html_out, title="Demo Track", vocals_wav=vocals)
+    content = html_out.read_text(encoding="utf-8")
+    assert "data:audio/mpeg;base64," in content
+    assert "Привет" in content and "Demo Track" in content
+
+
+
+
 

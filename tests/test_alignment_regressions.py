@@ -770,6 +770,56 @@ def test_editor_text_to_lines_honors_manual_stretch_and_slight_overlap():
     assert res2[1][0]["start"] == pytest.approx(12.50, abs=0.02)
 
 
+def test_realign_bad_lines_stretches_to_vocal_islands_in_corridor(tmp_path):
+    import wave
+    import numpy as np
+    from karaoke.aligner import realign_lines_by_vocals
+
+    sr = 16000
+    dur_s = 12.0
+    samples = np.zeros(int(sr * dur_s), dtype=np.float32)
+    t = np.arange(len(samples)) / sr
+    # Good line 0: 1.0..2.5
+    # Bad lines 1 & 2 should snap onto two distinct vocal islands at [3.5..5.2] and [6.2..8.0]
+    # Good line 3: 9.0..10.5
+    for a, b in [(1.0, 2.5), (3.5, 5.2), (6.2, 8.0), (9.0, 10.5)]:
+        mask = (t >= a) & (t <= b)
+        samples[mask] = 0.25 * np.sin(2 * np.pi * 220 * t[mask])
+
+    voc_path = tmp_path / "vocals.wav"
+    with wave.open(str(voc_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes((samples * 32767).astype(np.int16).tobytes())
+
+    lines = [
+        words("Первая хорошая строка", 1.0, 0.5),
+        words("Плохая первая", 2.6, 0.4),   # stuck too early in silence!
+        words("Плохая вторая", 3.4, 0.4),   # stuck too early!
+        words("Последняя хорошая", 9.0, 0.7),
+    ]
+
+    out, updated = realign_lines_by_vocals(
+        lines,
+        voc_path,
+        target_indices=[1, 2],
+        bad_indices={1, 2},
+        locked_indices={0, 3},
+    )
+    validate_karaoke_lines(out)
+    assert updated == [1, 2]
+    # Locked lines untouched
+    assert out[0][0]["start"] == pytest.approx(1.0, abs=0.02)
+    assert out[3][0]["start"] == pytest.approx(9.0, abs=0.02)
+    # Bad lines stretched onto the two vocal islands [3.5..5.2] and [6.2..8.0]
+    assert out[1][0]["start"] >= 3.40
+    assert out[1][-1]["end"] <= 5.35
+    assert out[2][0]["start"] >= 6.10
+    assert out[2][-1]["end"] <= 8.15
+
+
+
 
 
 

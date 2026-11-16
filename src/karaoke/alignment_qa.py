@@ -5,7 +5,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from karaoke.aligner import (
+    _VOWELLESS_PROCLITICS,
     _build_syllable_timings_from_onsets,
+    _build_whisper_anchored_line,
+    _clamp_proclitics_and_short_onsets,
+    _expand_recognized_words_for_ref,
+    _match_line_words_to_whisper,
     _rebalance_squashed_words,
     compute_vocal_rms_envelope,
     count_syllables,
@@ -154,10 +159,10 @@ def _score_single_line(
             hang_score -= 40.0
     hang_score = max(0.0, min(100.0, hang_score))
 
-    # 4. Tempo smoothness (20%): squashed words & extreme syllable-rate spikes
+    # 4. Tempo smoothness (20%): squashed words, stretched proclitics, & syllable-rate spikes
     tempo_score = 100.0
     syl_rates: List[float] = []
-    for w in line:
+    for w_idx, w in enumerate(line):
         dur = max(0.01, float(w["end"]) - float(w["start"]))
         syls = max(1, int(w.get("syllables", count_syllables(w["text"]))))
         per_syl = dur / syls
@@ -166,6 +171,17 @@ def _score_single_line(
             if "squashed_word" not in issues:
                 issues.append("squashed_word")
             tempo_score -= 22.0
+        if _norm_word(w["text"]) in _VOWELLESS_PROCLITICS and w_idx < len(line) - 1 and dur > 0.18:
+            if "stretched_proclitic" not in issues:
+                issues.append("stretched_proclitic")
+            tempo_score -= min(20.0, (dur - 0.15) * 40.0)
+    if len(line) >= 3 and count_syllables(line[0]["text"]) == 1:
+        w0_dur = max(0.01, float(line[0]["end"]) - float(line[0]["start"]))
+        rest_avg = sum(syl_rates[1:]) / max(1, len(syl_rates[1:]))
+        if w0_dur > 0.50 and rest_avg < 0.25:
+            if "stretched_short_onset" not in issues:
+                issues.append("stretched_short_onset")
+            tempo_score -= min(18.0, (w0_dur - 0.45) * 30.0)
     if len(syl_rates) >= 2:
         max_r = max(syl_rates)
         min_r = max(0.05, min(syl_rates))
@@ -173,6 +189,13 @@ def _score_single_line(
             if "tempo_spike" not in issues:
                 issues.append("tempo_spike")
             tempo_score -= min(25.0, (max_r / min_r - 6.0) * 4.0)
+        elif len(syl_rates) >= 3:
+            nf_max = max(syl_rates[:-1])
+            nf_min = max(0.05, min(syl_rates[:-1]))
+            if nf_max > 0.55 and (nf_max / nf_min) > 4.5:
+                if "tempo_spike" not in issues:
+                    issues.append("tempo_spike")
+                tempo_score -= min(15.0, (nf_max / nf_min - 4.0) * 3.5)
     tempo_score = max(0.0, min(100.0, tempo_score))
 
     overall = (
@@ -271,15 +294,19 @@ def _optimize_line_pass(
     if not line:
         return
 
-    # 1. Fix late or early onset on line[0]
+    # 1. Fix late or early onset on line[0] (bounded to +-0.30s and preserving natural line duration)
     if rms is not None and len(rms) > 0 and ("late_onset" in issues or "early_onset" in issues):
         w0 = line[0]
         w0_s, w0_e = float(w0["start"]), float(w0["end"])
+        l_end = float(line[-1]["end"])
+        tot_sylls = sum(max(1, int(w.get("syllables", count_syllables(w["text"])))) for w in line)
+        min_line_dur = min(l_end - prev_end - 0.02, max(0.60, tot_sylls * 0.16))
+        max_start = max(prev_end + 0.02, l_end - min_line_dur)
         search_from = max(prev_end + 0.02, w0_s - 0.90)
-        search_to = min(w0_e - 0.12, w0_s + 0.90)
-        if search_to > search_from + 0.20:
+        search_to = min(w0_e - 0.12, w0_s + 0.30, max_start)
+        if search_to > search_from + 0.10:
             real_onset = find_vocal_onset(rms, hop_s, search_from, w0_e, fallback=w0_s)
-            real_onset = max(prev_end + 0.02, min(w0_e - 0.12, round(real_onset, 2)))
+            real_onset = max(search_from, min(search_to, round(real_onset, 2)))
             if abs(real_onset - w0_s) >= 0.06:
                 w0["start"] = real_onset
 
@@ -310,7 +337,8 @@ def _optimize_line_pass(
                 if ws + 0.14 <= real_off < we - 0.12:
                     w["end"] = round(real_off, 2)
 
-    # 4. Rebalance squashed words
+    # 4. Clamp stretched proclitics/1-syllable onsets & rebalance squashed words
+    _clamp_proclitics_and_short_onsets(line, rms, hop_s, prev_end=prev_end)
     _rebalance_squashed_words(line)
 
     # 5. Enforce monotonic bounds inside line and against neighbors
@@ -402,9 +430,14 @@ def whisper_line_candidate(
     recognized_words: Optional[List[Dict[str, Any]]],
 ) -> Optional[List[Dict[str, Any]]]:
     """Rebuilds `line` with raw Whisper word timings when every word can be matched (same text, nearby time)."""
-    rw = [w for w in (recognized_words or []) if "start" in w and "end" in w and "text" in w]
-    if not line or not rw:
+    rw_raw = [w for w in (recognized_words or []) if "start" in w and "end" in w and "text" in w]
+    if not line or not rw_raw:
         return None
+    rw = _expand_recognized_words_for_ref(
+        rw_raw,
+        [_norm_word(w["text"]) for w in line],
+        [str(w["text"]) for w in line],
+    )
     out: List[Dict[str, Any]] = []
     cursor = -1e9
     for w in line:
@@ -434,8 +467,8 @@ def optimize_alignment_to_target(
     lines: List[List[Dict[str, Any]]],
     vocals_path: Optional[Path],
     ctc_lines: Optional[List[List[Dict[str, Any]]]] = None,
-    target_score: float = 90.0,
-    max_iters: int = 4,
+    target_score: float = 99.0,
+    max_iters: int = 8,
     recognized_words: Optional[List[Dict[str, Any]]] = None,
     locked_lines: Optional[Dict[int, List[Dict[str, Any]]]] = None,
     bad_lines: Optional[Dict[int, List[Dict[str, Any]]]] = None,
@@ -521,18 +554,27 @@ def optimize_alignment_to_target(
             pass
 
     best_report = evaluate_alignment_quality(best_lines, vocals_path, rms_cache=rms_cache)
+    iterations_history: List[Dict[str, Any]] = [{
+        "iter": 0,
+        "overall_score": best_report["overall_score"],
+        "onset_score": best_report["onset_score"],
+        "coverage_score": best_report["coverage_score"],
+        "hang_score": best_report["hang_score"],
+        "tempo_score": best_report["tempo_score"],
+        "improved_lines": len(anchor_repaired),
+    }]
     pending_bad = [i for i in bad if 0 <= i < len(best_lines) and not _line_differs(best_lines[i], bad[i])]
     if rms is None or len(rms) == 0 or (best_report["overall_score"] >= target_score and not pending_bad):
-        return best_lines, _annotate_report(best_report, locked, bad, best_lines, anchor_repaired)
+        return best_lines, _annotate_report(best_report, locked, bad, best_lines, anchor_repaired, iterations_history)
 
     current_lines = copy.deepcopy(best_lines)
-    for _ in range(max_iters):
+    for iter_idx in range(1, max_iters + 1):
         cur_report = evaluate_alignment_quality(current_lines, vocals_path, rms_cache=rms_cache)
         pending_bad = [i for i in bad if 0 <= i < len(current_lines) and not _line_differs(current_lines[i], bad[i])]
         if cur_report["overall_score"] >= target_score and not pending_bad:
             break
 
-        improved_any = False
+        improved_count = 0
         for idx, line in enumerate(current_lines):
             if idx in locked:
                 continue
@@ -543,25 +585,56 @@ def optimize_alignment_to_target(
             prev_e = float(current_lines[idx - 1][-1]["end"]) if idx > 0 and current_lines[idx - 1] else 0.0
             next_s = float(current_lines[idx + 1][0]["start"]) if idx + 1 < len(current_lines) and current_lines[idx + 1] else None
 
-            candidate_line = copy.deepcopy(line)
             issues = list(l_rep["issues"])
             if forced_bad:
-                issues = list(set(issues) | {"late_onset", "mid_gap", "trailing_silence"})
-            _optimize_line_pass(candidate_line, prev_e, next_s, rms, hop_s, issues)
-            if not _ok(idx, candidate_line):
-                continue
-            new_rep = _score_single_line(candidate_line, prev_e, next_s, rms, hop_s)
-            min_gain = -3.0 if forced_bad else 0.1
-            if new_rep["score"] > l_rep["score"] + min_gain:
-                current_lines[idx] = candidate_line
-                improved_any = True
+                issues = list(set(issues) | {"late_onset", "mid_gap", "trailing_silence", "stretched_proclitic"})
 
-        if not improved_any:
+            candidates: List[List[Dict[str, Any]]] = []
+            cand_opt = copy.deepcopy(line)
+            _optimize_line_pass(cand_opt, prev_e, next_s, rms, hop_s, issues)
+            candidates.append(cand_opt)
+
+            # On iter 1 or bad-marked lines, also try Whisper-anchored reconstruction
+            if recognized_words and (iter_idx == 1 or forced_bad or "tempo_spike" in issues or "stretched_proclitic" in issues or "stretched_short_onset" in issues):
+                w_s = max(prev_e, float(line[0]["start"]))
+                w_e = min(next_s, float(line[-1]["end"])) if next_s is not None else float(line[-1]["end"])
+                if w_e > w_s + 0.15:
+                    wm = _match_line_words_to_whisper(line, recognized_words, w_s, w_e)
+                    if len(wm) >= max(2, (len(line) + 1) // 2):
+                        cand_w = _build_whisper_anchored_line(line, wm, w_s, w_e, rms, hop_s)
+                        for cw in cand_w:
+                            _refresh_word_syllable_timings(cw, rms, hop_s)
+                        candidates.append(cand_w)
+
+            best_cand = None
+            best_cand_score = l_rep["score"] + (-3.0 if forced_bad else 0.1)
+            for cand in candidates:
+                if not _ok(idx, cand):
+                    continue
+                new_rep = _score_single_line(cand, prev_e, next_s, rms, hop_s)
+                if new_rep["score"] > best_cand_score:
+                    best_cand = cand
+                    best_cand_score = new_rep["score"]
+
+            if best_cand is not None:
+                current_lines[idx] = best_cand
+                improved_count += 1
+
+        if improved_count == 0:
             break
 
         try:
             validate_karaoke_lines(current_lines)
             new_full_report = evaluate_alignment_quality(current_lines, vocals_path, rms_cache=rms_cache)
+            iterations_history.append({
+                "iter": iter_idx,
+                "overall_score": new_full_report["overall_score"],
+                "onset_score": new_full_report["onset_score"],
+                "coverage_score": new_full_report["coverage_score"],
+                "hang_score": new_full_report["hang_score"],
+                "tempo_score": new_full_report["tempo_score"],
+                "improved_lines": improved_count,
+            })
             fixed_bad = sum(1 for i in bad if 0 <= i < len(current_lines) and _line_differs(current_lines[i], bad[i]))
             prev_fixed = sum(1 for i in bad if 0 <= i < len(best_lines) and _line_differs(best_lines[i], bad[i]))
             if new_full_report["overall_score"] > best_report["overall_score"] or fixed_bad > prev_fixed:
@@ -571,7 +644,7 @@ def optimize_alignment_to_target(
             break
 
     validate_karaoke_lines(best_lines)
-    return best_lines, _annotate_report(best_report, locked, bad, best_lines, anchor_repaired)
+    return best_lines, _annotate_report(best_report, locked, bad, best_lines, anchor_repaired, iterations_history)
 
 
 def _annotate_report(
@@ -580,6 +653,7 @@ def _annotate_report(
     bad: Dict[int, List[Dict[str, Any]]],
     lines: List[List[Dict[str, Any]]],
     anchor_repaired: Optional[List[int]] = None,
+    iterations_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     report = dict(report)
     report["anchor_repaired_lines"] = sorted(anchor_repaired or [])
@@ -590,6 +664,8 @@ def _annotate_report(
     report["unchanged_bad_lines"] = sorted(
         i for i in bad if 0 <= i < len(lines) and not _line_differs(lines[i], bad[i])
     )
+    if iterations_history is not None:
+        report["iterations_history"] = iterations_history
     return report
 
 

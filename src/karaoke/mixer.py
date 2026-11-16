@@ -191,3 +191,47 @@ def ensure_full_guide_mix(
         vocal_intervals=None,
     )
 
+
+def shift_pitch_wav(
+    src_wav: Path,
+    dst_wav: Path,
+    semitones: float = 0.0,
+) -> Path:
+    """
+    Shifts the musical pitch of `src_wav` by `semitones` (-12..+12) without changing tempo.
+    Tries FFmpeg `rubberband` first, falling back to `asetrate + aresample + atempo`.
+    Returns `src_wav` unchanged when |semitones| < 0.01.
+    """
+    import subprocess
+    from karaoke.video import find_ffmpeg
+
+    n = max(-12.0, min(12.0, float(semitones or 0.0)))
+    if abs(n) < 0.01:
+        return src_wav
+
+    src_wav = Path(src_wav)
+    dst_wav = Path(dst_wav)
+    dst_wav.parent.mkdir(parents=True, exist_ok=True)
+    ratio = 2.0 ** (n / 12.0)
+    ffmpeg_bin = find_ffmpeg()
+
+    filter_attempts = [
+        f"rubberband=pitch={ratio:.6f}",
+        f"asetrate=44100*{ratio:.6f},aresample=44100,atempo={1.0 / ratio:.6f}",
+    ]
+    last_err = ""
+    for af in filter_attempts:
+        cmd = [
+            ffmpeg_bin, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", str(src_wav),
+            "-af", af,
+            "-c:a", "pcm_s16le",
+            str(dst_wav),
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        if proc.returncode == 0 and dst_wav.exists() and dst_wav.stat().st_size > 1024:
+            return dst_wav
+        last_err = proc.stderr.decode(errors="replace")[-400:]
+
+    raise RuntimeError(f"Не удалось изменить тональность ({semitones:+.1f}): {last_err}")
+

@@ -667,7 +667,12 @@ def set_line_timing(title: str, line_index: int, new_start: float, new_end: floa
             w.pop("syllable_timings", None)
         _trim_neighbours(lines, line_index)
         if realign_by_vocals and s.get("vocals_wav"):
-            lines, _ = realign_lines_by_vocals(lines, Path(s["vocals_wav"]), [line_index])
+            lines, _ = realign_lines_by_vocals(
+                lines,
+                Path(s["vocals_wav"]),
+                [line_index],
+                recognized_words=s.get("recognized_words"),
+            )
         s["lines"] = lines
         _save_state(title, s, "manual", prev)
         notify_studio_ui("project_updated", title, f"Строка {line_index} перенесена через MCP", "timing_shifted")
@@ -820,7 +825,12 @@ def realign_lines(title: str, line_indices: List[int], mode: str = "vocals") -> 
                     _trim_neighbours(lines, idx)
                     updated.append(idx)
         else:
-            lines, updated = realign_lines_by_vocals(lines, vocals, line_indices)
+            lines, updated = realign_lines_by_vocals(
+                lines,
+                vocals,
+                line_indices,
+                recognized_words=s.get("recognized_words"),
+            )
         s["lines"] = lines
         _save_state(title, s, "realign_vocals" if mode != "whisper" else "manual", prev)
         notify_studio_ui("project_updated", title, f"Пересчитано строк: {len(updated)}", "timing_shifted")

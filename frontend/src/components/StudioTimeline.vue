@@ -33,22 +33,33 @@ const isRealigningPending = ref(false)
 
 const pendingRows = computed(() => {
   const lines = projectStore.currentProject?.lines || []
-  return projectStore.pendingRealignIndices
+  const marks = projectStore.lineMarkByIdx || {}
+  const idxSet = new Set<number>(projectStore.pendingRealignIndices)
+  for (const [k, v] of Object.entries(marks)) {
+    if (v === 'bad') idxSet.add(Number(k))
+  }
+  return Array.from(idxSet)
+    .sort((a, b) => a - b)
     .filter((idx) => idx >= 0 && idx < lines.length && Array.isArray(lines[idx]) && lines[idx].length > 0)
     .map((idx) => {
       const ln = lines[idx]
       const start = Number(ln[0]?.start ?? 0)
       const end = Number(ln[ln.length - 1]?.end ?? 0)
       const text = ln.map((w: any) => w.text || '').join(' ').trim()
-      return { idx, start, end, text }
+      return { idx, start, end, text, isBad: marks[String(idx)] === 'bad' }
     })
 })
 
 async function handleRealignPending() {
-  if (isRealigningPending.value || projectStore.pendingRealignIndices.length === 0) return
+  const targetIndices = pendingRows.value.map((r) => r.idx)
+  if (isRealigningPending.value || targetIndices.length === 0) return
   isRealigningPending.value = true
   try {
-    await projectStore.realignPendingLines()
+    const data = await projectStore.realignChangedByVocals(targetIndices)
+    if (data?.status === 'ok') {
+      const updatedSet = new Set<number>(data.updated_indices || [])
+      projectStore.pendingRealignIndices = projectStore.pendingRealignIndices.filter((i) => !updatedSet.has(i))
+    }
     showPendingDropdown.value = false
     draw()
   } finally {
@@ -333,12 +344,42 @@ function draw() {
   const yLyrics = 24
   const hLyrics = 46
   const pendingSet = new Set(projectStore.pendingRealignIndices)
+  const marksMap = projectStore.lineMarkByIdx || {}
   const rawLines = projectStore.currentProject?.lines || []
   lyricBlocks.value.forEach((b: any) => {
     const bx = timeToX(b.start, w)
     const bw = Math.max(6, timeToX(b.end, w) - bx)
     const isPending = pendingSet.has(b.index)
+    const mark = marksMap[String(b.index)]
+    const isBad = mark === 'bad'
+    const isGood = mark === 'good'
     const lineWords = Array.isArray(rawLines[b.index]) ? rawLines[b.index] : []
+
+    let topCol = 'rgba(14, 165, 233, 0.42)'
+    let botCol = 'rgba(2, 132, 199, 0.26)'
+    let borderCol = '#38bdf8'
+    let label = b.text
+    let tickCol = 'rgba(125, 211, 252, 0.55)'
+
+    if (isBad) {
+      topCol = 'rgba(239, 68, 68, 0.56)'
+      botCol = 'rgba(185, 28, 28, 0.38)'
+      borderCol = isPending ? '#fbbf24' : '#f87171'
+      label = `👎 ${b.text}`
+      tickCol = 'rgba(248, 113, 113, 0.72)'
+    } else if (isPending) {
+      topCol = 'rgba(245, 158, 11, 0.48)'
+      botCol = 'rgba(217, 119, 6, 0.28)'
+      borderCol = '#fbbf24'
+      label = `🎙️ ${b.text}`
+      tickCol = 'rgba(251, 191, 36, 0.65)'
+    } else if (isGood) {
+      topCol = 'rgba(16, 185, 129, 0.36)'
+      botCol = 'rgba(5, 150, 105, 0.22)'
+      borderCol = '#34d399'
+      label = `👍 ${b.text}`
+      tickCol = 'rgba(52, 211, 153, 0.60)'
+    }
 
     drawPillBlock(
       ctx,
@@ -346,17 +387,17 @@ function draw() {
       yLyrics + 6,
       bw,
       hLyrics - 12,
-      isPending ? 'rgba(245, 158, 11, 0.48)' : 'rgba(14, 165, 233, 0.42)',
-      isPending ? 'rgba(217, 119, 6, 0.28)' : 'rgba(2, 132, 199, 0.26)',
-      isPending ? '#fbbf24' : '#38bdf8',
-      isPending ? `🎙️ ${b.text}` : b.text,
+      topCol,
+      botCol,
+      borderCol,
+      label,
       '#f0f9ff',
       `600 11px ${UI_FONT}`
     )
 
     // Subtle bottom tick marks for word boundaries at >= 2x zoom without obscuring line text
     if (bw >= 60 && lineWords.length > 1 && zoomFactor.value >= 2) {
-      ctx.strokeStyle = isPending ? 'rgba(251, 191, 36, 0.65)' : 'rgba(125, 211, 252, 0.55)'
+      ctx.strokeStyle = tickCol
       ctx.lineWidth = 1
       for (let wIdx = 1; wIdx < lineWords.length; wIdx++) {
         const wsx = Math.round(timeToX(Number(lineWords[wIdx].start ?? b.start), w)) + 0.5
@@ -930,6 +971,28 @@ function clearAllIntervals() {
   draw()
 }
 
+async function onContextMenu(e: MouseEvent) {
+  const canvas = canvasRef.value
+  if (!canvas || !projectStore.hasProject) return
+  const rect = canvas.getBoundingClientRect()
+  const w = logicalWidth.value
+  const mouseX = e.clientX - rect.left
+  const mouseY = e.clientY - rect.top
+  if (mouseY <= 24 || mouseY > 70) return
+
+  for (const b of lyricBlocks.value) {
+    const bx = timeToX(b.start, w)
+    const bw = Math.max(6, timeToX(b.end, w) - bx)
+    if (mouseX >= bx && mouseX <= bx + bw) {
+      const cur = projectStore.lineMarkByIdx[String(b.index)]
+      const next: 'good' | 'bad' | null = cur === 'bad' ? 'good' : cur === 'good' ? null : 'bad'
+      await projectStore.setLineMark(b.index, next)
+      draw()
+      return
+    }
+  }
+}
+
 watch(
   [
     () => playerStore.currentTime,
@@ -937,6 +1000,7 @@ watch(
     () => playerStore.selStart,
     () => playerStore.selEnd,
     () => projectStore.pendingRealignIndices,
+    () => projectStore.lineMarkByIdx,
   ],
   () => {
     draw()
@@ -1175,6 +1239,7 @@ onUnmounted(() => {
         <canvas
           ref="canvasRef"
           @mousedown="onMouseDown"
+          @contextmenu.prevent="onContextMenu"
           class="cursor-crosshair block"
         ></canvas>
       </div>

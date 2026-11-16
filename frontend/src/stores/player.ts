@@ -17,9 +17,10 @@ export const usePlayerStore = defineStore('player', () => {
   const videoEl = ref<HTMLVideoElement | null>(null)
   const audioEl = ref<HTMLAudioElement | null>(null)
 
-  // Guards against WebKit seek-storms and AbortError during slider dragging
+  // Guards against WebKit seek-storms, stale play promises, and buffer dropouts
   let audioPlayPending = false
   let lastAudioSyncMs = 0
+  let playSessionId = 0
 
   const effectiveVocalMultiplier = computed(() =>
     Math.max(liveVocalMultiplier.value, timelineVocalVolume.value)
@@ -73,22 +74,37 @@ export const usePlayerStore = defineStore('player', () => {
 
     const now = Date.now()
     const canSeek = !a.seeking && !v.seeking && a.readyState >= 1
-    const diff = Math.abs((a.currentTime || 0) - (v.currentTime || 0))
+    const rawDiff = (v.currentTime || 0) - (a.currentTime || 0)
+    const diff = Math.abs(rawDiff)
 
-    if (canSeek && (forceSeek ? diff > 0.05 : diff > 0.25 && now - lastAudioSyncMs > 1200)) {
+    if (canSeek && (forceSeek ? diff > 0.05 : diff > 0.65 && now - lastAudioSyncMs > 2500)) {
       try {
+        a.playbackRate = 1.0
         a.currentTime = v.currentTime
         lastAudioSyncMs = now
       } catch (_) {}
+    } else if (!forceSeek && !v.paused && !a.paused) {
+      // Smooth playbackRate micro-catchup avoids hard-seek buffer dropouts/stuttering
+      if (diff > 0.08) {
+        const targetRate = rawDiff > 0 ? 1.05 : 0.95
+        if (Math.abs(a.playbackRate - targetRate) > 0.005) {
+          a.playbackRate = targetRate
+        }
+      } else if (diff <= 0.05 && a.playbackRate !== 1.0) {
+        a.playbackRate = 1.0
+      }
     }
 
     if (!v.paused && !v.ended) {
-      if (a.paused && !audioPlayPending) {
+      if (a.paused && !audioPlayPending && a.readyState >= 1) {
+        const session = playSessionId
         audioPlayPending = true
         a.play()
           .catch(() => {})
           .finally(() => {
-            audioPlayPending = false
+            if (session === playSessionId) {
+              audioPlayPending = false
+            }
           })
       }
     }
@@ -139,30 +155,39 @@ export const usePlayerStore = defineStore('player', () => {
       }
     }
 
+    playSessionId += 1
+    const session = playSessionId
     timelineVocalVolume.value = computeTimelineVocalAt(currentTime.value)
     applyVolumes()
 
-    videoEl.value.play().catch(() => {})
-
-    // Always start audioEl on the user's Play gesture so WebKit unlocks the audio element
-    // and keeps it buffered in lockstep with videoEl (muted when vocal level is 0%)
+    // Align audioEl while paused BEFORE starting both media elements to avoid post-pause drift
     if (audioEl.value && audioEl.value.src) {
+      audioEl.value.playbackRate = 1.0
       if (
         audioEl.value.readyState >= 1 &&
         !audioEl.value.seeking &&
-        Math.abs(audioEl.value.currentTime - videoEl.value.currentTime) > 0.1
+        Math.abs(audioEl.value.currentTime - videoEl.value.currentTime) > 0.05
       ) {
         try {
           audioEl.value.currentTime = videoEl.value.currentTime
           lastAudioSyncMs = Date.now()
         } catch (_) {}
       }
+    }
+
+    videoEl.value.play().catch(() => {})
+
+    // Always start audioEl on the user's Play gesture so WebKit unlocks the audio element
+    // and keeps it buffered in lockstep with videoEl (muted when vocal level is 0%)
+    if (audioEl.value && audioEl.value.src) {
       audioPlayPending = true
       audioEl.value
         .play()
         .catch(() => {})
         .finally(() => {
-          audioPlayPending = false
+          if (session === playSessionId) {
+            audioPlayPending = false
+          }
         })
     }
 
@@ -170,8 +195,13 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   function pause() {
+    playSessionId += 1
+    audioPlayPending = false
     if (videoEl.value) videoEl.value.pause()
-    if (audioEl.value) audioEl.value.pause()
+    if (audioEl.value) {
+      audioEl.value.pause()
+      audioEl.value.playbackRate = 1.0
+    }
     isPlaying.value = false
   }
 

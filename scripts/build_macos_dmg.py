@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -130,13 +131,15 @@ def build_macos_app_and_dmg() -> Path:
     if (FRONTEND_DIR / "dist").exists():
         shutil.copytree(FRONTEND_DIR / "dist", resources_dir / "frontend" / "dist", dirs_exist_ok=True)
 
-    # 4. Write Info.plist
+    # 4. Write Info.plist (read version from pyproject.toml)
+    with open(ROOT_DIR / "pyproject.toml", "rb") as f:
+        app_version = tomllib.load(f).get("project", {}).get("version", "0.7.0")
     info_plist = {
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": "ru.karaokestudio.ai.app",
-        "CFBundleVersion": "0.5.2",
-        "CFBundleShortVersionString": "0.5.2",
+        "CFBundleVersion": app_version,
+        "CFBundleShortVersionString": app_version,
         "CFBundlePackageType": "APPL",
         "CFBundleExecutable": "AIKaraokeStudioLauncher",
         "CFBundleIconFile": "AppIcon.icns",

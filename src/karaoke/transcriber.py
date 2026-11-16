@@ -1,10 +1,48 @@
 import re
+import subprocess
 import torch
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
+import numpy as np
 import whisper_timestamped as whisper
-from karaoke.aligner import refine_word_timestamps, align_russian_ctc_on_segments
+from karaoke.aligner import (
+    refine_word_timestamps,
+    align_russian_ctc_on_segments,
+    compute_vocal_rms_envelope,
+)
 from karaoke.cancel_manager import check_cancelled, GenerationCancelledError
+from karaoke.video import find_ffmpeg
+
+LEVEL_VOICE_FILTER = "highpass=f=80,dynaudnorm=f=200:g=15:p=0.9,alimiter=limit=0.95"
+
+
+def _load_audio_16k_mono(vocals_path: Path, level_voice: bool = True) -> np.ndarray:
+    """
+    Loads vocals at 16 kHz mono float32, optionally applying dynamic loudness levelling
+    (highpass + dynaudnorm + limiter) so quiet verses/whispers and loud choruses/screams
+    reach Whisper at consistent intelligibility without altering pitch or timing.
+    """
+    if level_voice:
+        try:
+            ffmpeg_bin = find_ffmpeg()
+            cmd = [
+                ffmpeg_bin,
+                "-v", "error",
+                "-i", str(vocals_path),
+                "-vn",
+                "-ac", "1",
+                "-ar", "16000",
+                "-af", LEVEL_VOICE_FILTER,
+                "-f", "s16le",
+                "-",
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            if proc.returncode == 0 and len(proc.stdout) >= 3200:
+                pcm = np.frombuffer(proc.stdout[: (len(proc.stdout) // 2) * 2], dtype="<i2")
+                return pcm.astype(np.float32) / 32768.0
+        except Exception as e:
+            print(f"[Karaoke] Предупреждение: vocal levelling пропущен ({e}), читаем напрямую...")
+    return whisper.load_audio(str(vocals_path))
 
 WHISPER_MODELS = [
     "large-v3-turbo",                     # Рекомендуется: быстрая и точная для русского, песен, оперы (по умолчанию)
@@ -47,13 +85,129 @@ def is_hallucinated_segment(text: str) -> bool:
     return False
 
 
+def _recover_skipped_vocal_gaps(
+    model: Any,
+    audio_16k: np.ndarray,
+    vocals_path: Path,
+    segments: List[Dict[str, Any]],
+    language: str,
+    initial_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Finds gaps (>= 2.5s) where vocals.wav has strong sustained vocal energy (>= 1.8s)
+    but the primary Whisper+VAD pass returned nothing, and re-transcribes those slices
+    without VAD and with relaxed speech thresholds.
+    """
+    try:
+        rms, hop_s = compute_vocal_rms_envelope(vocals_path)
+        if rms is None or len(rms) == 0:
+            return segments
+
+        sr_16k = 16000
+        total_dur = len(audio_16k) / sr_16k
+        p90 = float(np.percentile(rms, 90))
+        thresh = max(0.012, p90 * 0.14)
+
+        sorted_segs = sorted(segments, key=lambda s: float(s.get("start", 0.0)))
+        covered: List[Tuple[float, float]] = [
+            (float(s.get("start", 0.0)), float(s.get("end", 0.0)))
+            for s in sorted_segs
+            if float(s.get("end", 0.0)) > float(s.get("start", 0.0))
+        ]
+
+        gaps: List[Tuple[float, float]] = []
+        cursor = 0.0
+        for cs, ce in covered:
+            if cs - cursor >= 2.5:
+                gaps.append((cursor, cs))
+            cursor = max(cursor, ce)
+        if total_dur - cursor >= 2.5:
+            gaps.append((cursor, total_dur))
+
+        # Build prompt only from explicitly provided lyrics (never borrow later song segments for earlier gaps)
+        prompt = initial_prompt.strip() if initial_prompt and initial_prompt.strip() else ""
+        if prompt:
+            prompt = " ".join(prompt.split()[:100])
+
+        recovered: List[Dict[str, Any]] = []
+        for g_s, g_e in gaps:
+            check_cancelled()
+            i_s = max(0, int(g_s / hop_s))
+            i_e = min(len(rms), int(g_e / hop_s))
+            win = rms[i_s:i_e]
+            if len(win) == 0:
+                continue
+            active_dur = float(np.sum(win > thresh)) * hop_s
+            if active_dur < 1.8:
+                continue
+
+            slice_s = max(0.0, g_s - 0.15)
+            slice_e = min(total_dur, g_e + 0.15)
+            s_idx = int(slice_s * sr_16k)
+            e_idx = int(slice_e * sr_16k)
+            if e_idx - s_idx < sr_16k:
+                continue
+
+            print(f"[Karaoke] Дораспознавание пропущенного вокального участка [{slice_s:.1f}s -> {slice_e:.1f}s] (активный вокал {active_dur:.1f}s)...")
+            kw: Dict[str, Any] = {
+                "model": model,
+                "audio": audio_16k[s_idx:e_idx],
+                "language": language,
+                "verbose": False,
+                "vad": None,
+                "no_speech_threshold": 0.95,
+                "logprob_threshold": -2.0,
+                "compression_ratio_threshold": 3.2,
+                "condition_on_previous_text": False,
+                "detect_disfluencies": False,
+            }
+            if prompt:
+                kw["initial_prompt"] = prompt
+
+            try:
+                res = whisper.transcribe(**kw)
+            except Exception as exc:
+                print(f"[Karaoke] Предупреждение при дораспознавании [{slice_s:.1f}s->{slice_e:.1f}s]: {exc}")
+                continue
+
+            for seg in res.get("segments", []) or []:
+                s_txt = seg.get("text", "").strip()
+                if is_hallucinated_segment(s_txt):
+                    continue
+                seg_copy = dict(seg)
+                seg_copy["start"] = round(slice_s + float(seg.get("start", 0.0)), 2)
+                seg_copy["end"] = round(slice_s + float(seg.get("end", 0.0)), 2)
+                if seg_copy["end"] <= seg_copy["start"]:
+                    continue
+                new_words = []
+                for w in seg.get("words", []) or []:
+                    wc = dict(w)
+                    wc["start"] = round(slice_s + float(w.get("start", 0.0)), 2)
+                    wc["end"] = round(slice_s + float(w.get("end", 0.0)), 2)
+                    new_words.append(wc)
+                seg_copy["words"] = new_words
+                recovered.append(seg_copy)
+
+        if not recovered:
+            return segments
+
+        merged = list(segments) + recovered
+        merged.sort(key=lambda s: float(s.get("start", 0.0)))
+        return merged
+    except GenerationCancelledError:
+        raise
+    except Exception as exc:
+        print(f"[Karaoke] Предупреждение _recover_skipped_vocal_gaps: {exc}")
+        return segments
+
+
 def transcribe_vocals(
     vocals_path: Path,
     model_size: str = "large-v3-turbo",
     language: Optional[str] = "ru",
     device: Optional[str] = None,
     initial_prompt: Optional[str] = None,
-    use_ctc_align: bool = True,
+    use_ctc_align: bool = False,
     condition_on_previous_text: bool = False,
     vad: Optional[str] = "auditok",
 ) -> Dict[str, Any]:
@@ -102,7 +256,7 @@ def transcribe_vocals(
                 model = whisper.load_model("large-v3-turbo", device="cpu", backend="openai-whisper")
 
     check_cancelled()
-    audio = whisper.load_audio(str(vocals_path))
+    audio = _load_audio_16k_mono(vocals_path, level_voice=True)
     print(f"[Karaoke] Распознавание вокала и таймингов (язык={language})...")
 
     effective_vad = vad if vad and vad.lower() != "none" else None
@@ -139,14 +293,6 @@ def transcribe_vocals(
             transcribe_kwargs["model"] = model
         result = whisper.transcribe(**transcribe_kwargs)
 
-    check_cancelled()
-    # Free Whisper model memory before alignment
-    del model
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    elif device == "mps":
-        torch.mps.empty_cache()
-
     # Filter hallucinated subtitle lines and repetitive operatic vocalise loops
     raw_segments = result.get("segments", [])
     filtered_segments = []
@@ -155,7 +301,25 @@ def transcribe_vocals(
         if is_hallucinated_segment(s_text):
             continue
         filtered_segments.append(s)
+
+    # Recover long vocal sections skipped by VAD / no_speech_threshold (even without reference_lyrics)
+    filtered_segments = _recover_skipped_vocal_gaps(
+        model=model,
+        audio_16k=audio,
+        vocals_path=vocals_path,
+        segments=filtered_segments,
+        language=language,
+        initial_prompt=initial_prompt,
+    )
     result["segments"] = filtered_segments
+
+    check_cancelled()
+    # Free Whisper model memory before alignment
+    del model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "mps":
+        torch.mps.empty_cache()
 
     # Calibrate word timestamps with vocal energy envelope and anti-squash syllable balancing
     refined_segments = refine_word_timestamps(result, vocals_path=vocals_path)

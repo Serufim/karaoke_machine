@@ -107,6 +107,7 @@ class RebuildRequest(BaseModel):
     dual_audio_mp4: bool = True
     watermark_text: Optional[str] = None
     export_dir: Optional[str] = None
+    pitch_semitones: float = 0.0
 
 
 class DjExportRequest(BaseModel):
@@ -542,7 +543,7 @@ def split_lines(payload: SplitLinesRequest) -> Dict[str, Any]:
 
 
 @router.post("/project/{title}/optimize-timings")
-def optimize_project_timings(title: str, target_score: float = 90.0) -> Dict[str, Any]:
+def optimize_project_timings(title: str, target_score: float = 99.0) -> Dict[str, Any]:
     state_file = WORK_DIR / f"{title}_state.json"
     if not state_file.exists():
         raise HTTPException(status_code=404, detail=f"Project '{title}' not found")
@@ -709,19 +710,22 @@ def realign_changed_project_lines_by_vocals(title: str, payload: RealignChangedR
     else:
         working_lines = saved_lines
 
+    resolved_marks = timing_history.resolve_marks(working_lines, state_data.get("line_marks"))
+    bad_indices = {idx for idx, mk in resolved_marks.items() if mk == "bad"}
+    locked_indices = {idx for idx, mk in resolved_marks.items() if mk == "good"}
+
     if payload.line_indices:
-        target_indices = [i for i in payload.line_indices if 0 <= i < len(working_lines)]
+        target_indices = sorted({i for i in payload.line_indices if 0 <= i < len(working_lines) and i not in locked_indices})
     else:
-        target_indices = timing_history.find_changed_line_indices(saved_lines, working_lines)
-        if not target_indices:
+        changed = set(timing_history.find_changed_line_indices(saved_lines, working_lines))
+        if not changed:
             snaps = timing_history.list_snapshots(WORK_DIR, title)
             if snaps:
                 prev = timing_history.load_snapshot(WORK_DIR, title, snaps[0]["id"])
                 if prev:
-                    target_indices = timing_history.find_changed_line_indices(prev.get("lines") or [], working_lines)
-        if not target_indices:
-            resolved = timing_history.resolve_marks(working_lines, state_data.get("line_marks"))
-            target_indices = [idx for idx, mk in resolved.items() if mk == "bad"]
+                    changed = set(timing_history.find_changed_line_indices(prev.get("lines") or [], working_lines))
+        # Always include all 👎 (bad) marked lines even when other lines changed
+        target_indices = sorted((changed | bad_indices) - locked_indices)
 
     if not target_indices:
         return {
@@ -730,13 +734,22 @@ def realign_changed_project_lines_by_vocals(title: str, payload: RealignChangedR
             "lines": working_lines,
             "editor_text": lines_to_editor_text(working_lines),
             "alignment_report": state_data.get("alignment_report"),
+            "line_mark_by_idx": {str(k): v for k, v in resolved_marks.items()},
         }
 
     timing_history.save_snapshot(WORK_DIR, title, state_data, reason="realign_vocals")
-    new_lines, updated_indices = realign_lines_by_vocals(working_lines, vocals_wav, target_indices)
+    new_lines, updated_indices = realign_lines_by_vocals(
+        working_lines,
+        vocals_wav,
+        target_indices,
+        bad_indices=bad_indices,
+        locked_indices=locked_indices,
+        recognized_words=state_data.get("recognized_words"),
+    )
     new_editor_text = lines_to_editor_text(new_lines)
     report = evaluate_alignment_quality(new_lines, vocals_wav)
     marks = timing_history.refresh_mark_timings(new_lines, state_data.get("line_marks"))
+    new_resolved = timing_history.resolve_marks(new_lines, marks)
 
     state_data["lines"] = new_lines
     state_data["editor_text"] = new_editor_text
@@ -750,6 +763,7 @@ def realign_changed_project_lines_by_vocals(title: str, payload: RealignChangedR
         "lines": new_lines,
         "editor_text": new_editor_text,
         "alignment_report": report,
+        "line_mark_by_idx": {str(k): v for k, v in new_resolved.items()},
     }
 
 
@@ -1126,6 +1140,7 @@ def _run_rebuild_task(
     dual_audio_mp4: bool = True,
     watermark_text: Optional[str] = None,
     export_dir: Optional[str] = None,
+    pitch_semitones: float = 0.0,
 ):
     reset_cancel()
 
@@ -1178,6 +1193,7 @@ def _run_rebuild_task(
             video_quality=video_quality,
             dual_audio_mp4=dual_audio_mp4,
             watermark_text=watermark_text,
+            pitch_semitones=pitch_semitones,
             progress_callback=update_progress,
         )
 
@@ -1280,6 +1296,7 @@ def start_rebuild(payload: RebuildRequest) -> Dict[str, Any]:
             payload.dual_audio_mp4,
             payload.watermark_text,
             payload.export_dir,
+            payload.pitch_semitones,
         ),
         daemon=True,
     )
@@ -1349,6 +1366,124 @@ def download_kfn_file(title: str):
         media_type="application/octet-stream",
         filename=kfn_path.name,
     )
+
+
+@router.get("/lyrics/search")
+def search_lyrics_lrclib(q: str, artist: str = "", duration: float = 0.0, limit: int = 5) -> Dict[str, Any]:
+    from karaoke.lyrics_fetcher import LyricsFetchError, search_lrclib
+
+    try:
+        items = search_lrclib(track=q, artist=artist, duration=duration, limit=limit)
+    except LyricsFetchError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "ok", "results": items}
+
+
+class SplitLineRequest(BaseModel):
+    line_idx: int
+    word_idx: Optional[int] = None
+
+
+class JoinLineRequest(BaseModel):
+    line_idx: int
+
+
+@router.post("/project/{title}/split-line")
+def split_project_line(title: str, payload: SplitLineRequest) -> Dict[str, Any]:
+    from karaoke.aligner import split_line_by_breath_pause
+    from karaoke import timing_history
+
+    state_file, state_data = _load_state_or_404(title)
+    lines = state_data.get("lines") or []
+    if not (0 <= payload.line_idx < len(lines)) or len(lines[payload.line_idx]) < 2:
+        raise HTTPException(status_code=400, detail="Строка должна содержать минимум 2 слова для разбиения.")
+
+    timing_history.save_snapshot(WORK_DIR, title, state_data, reason="manual")
+    new_lines = split_line_by_breath_pause(lines, payload.line_idx, payload.word_idx)
+    new_editor = lines_to_editor_text(new_lines)
+    state_data["lines"] = new_lines
+    state_data["editor_text"] = new_editor
+    state_data["line_marks"] = timing_history.refresh_mark_timings(new_lines, state_data.get("line_marks"))
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"status": "ok", "lines": new_lines, "editor_text": new_editor, "line_marks": state_data["line_marks"]}
+
+
+@router.post("/project/{title}/join-line")
+def join_project_line(title: str, payload: JoinLineRequest) -> Dict[str, Any]:
+    from karaoke.aligner import join_with_next_line
+    from karaoke import timing_history
+
+    state_file, state_data = _load_state_or_404(title)
+    lines = state_data.get("lines") or []
+    if not (0 <= payload.line_idx < len(lines) - 1):
+        raise HTTPException(status_code=400, detail="Нет следующей строки для склейки.")
+
+    timing_history.save_snapshot(WORK_DIR, title, state_data, reason="manual")
+    new_lines = join_with_next_line(lines, payload.line_idx)
+    new_editor = lines_to_editor_text(new_lines)
+    state_data["lines"] = new_lines
+    state_data["editor_text"] = new_editor
+    state_data["line_marks"] = timing_history.refresh_mark_timings(new_lines, state_data.get("line_marks"))
+    state_file.write_text(json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"status": "ok", "lines": new_lines, "editor_text": new_editor, "line_marks": state_data["line_marks"]}
+
+
+class HtmlExportRequest(BaseModel):
+    editor_text: Optional[str] = None
+    vocal_volume: float = 0.0
+    vocal_intervals: Optional[List[Dict[str, Any]]] = None
+    pitch_semitones: float = 0.0
+
+
+@router.post("/project/{title}/export-html")
+def export_project_standalone_html(title: str, payload: HtmlExportRequest) -> Dict[str, Any]:
+    from karaoke.mixer import mix_guide_vocals, shift_pitch_wav
+    from karaoke.pro_exporter import export_standalone_html
+
+    _state_file, state_data = _load_state_or_404(title)
+    vocals_wav = Path(state_data["vocals_wav"])
+    no_vocals_wav = Path(state_data["no_vocals_wav"])
+    lines = state_data.get("lines", [])
+    if payload.editor_text and payload.editor_text.strip():
+        lines = editor_text_to_lines(payload.editor_text, original_lines=lines, vocals_path=vocals_wav)
+
+    vol_pct = int(round(payload.vocal_volume * 100))
+    mixed_wav = mix_guide_vocals(
+        instrumental_path=no_vocals_wav,
+        vocals_path=vocals_wav,
+        output_path=WORK_DIR / f"{title}_mix_{vol_pct}pct.wav",
+        vocal_volume=payload.vocal_volume,
+        vocal_intervals=payload.vocal_intervals if payload.vocal_intervals is not None else state_data.get("vocal_intervals"),
+    )
+    voc_for_html = vocals_wav if vocals_wav.exists() else None
+    if abs(float(payload.pitch_semitones or 0.0)) >= 0.01:
+        mixed_wav = shift_pitch_wav(mixed_wav, WORK_DIR / f"{title}_html_inst_pitch.wav", payload.pitch_semitones)
+        if voc_for_html is not None:
+            voc_for_html = shift_pitch_wav(voc_for_html, WORK_DIR / f"{title}_html_voc_pitch.wav", payload.pitch_semitones)
+
+    cover = Path(state_data["cover_image"]) if state_data.get("cover_image") else None
+    html_path = OUTPUT_DIR / f"{title}_karaoke.html"
+    export_standalone_html(
+        lines=lines,
+        instrumental_wav=mixed_wav,
+        output_path=html_path,
+        title=title,
+        vocals_wav=voc_for_html,
+        cover_path=cover if (cover and cover.exists()) else None,
+    )
+    return {
+        "status": "ok",
+        "html_url": f"/api/media/{title}/html",
+        "filename": html_path.name,
+    }
+
+
+@router.get("/media/{title}/html")
+def download_standalone_html(title: str):
+    html_path = OUTPUT_DIR / f"{title}_karaoke.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="HTML-плеер еще не собран.")
+    return FileResponse(html_path, media_type="text/html; charset=utf-8", filename=html_path.name)
 
 
 # Media streaming routes with range request support

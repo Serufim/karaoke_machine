@@ -260,18 +260,60 @@ async function handleRealignTimings() {
   }
 }
 
+const activeLineIdx = computed(() => {
+  const lines = projectStore.currentProject?.lines
+  if (!Array.isArray(lines) || lines.length === 0) return -1
+  const t = playerStore.currentTime || 0
+  const exact = lines.findIndex((ln: any[]) => ln?.length && t >= ln[0].start - 0.15 && t <= ln[ln.length - 1].end + 0.15)
+  if (exact !== -1) return exact
+  const upcoming = lines.findIndex((ln: any[]) => ln?.length && ln[0].start >= t)
+  return upcoming !== -1 ? upcoming : lines.length - 1
+})
+
+async function handleSplitActiveLine() {
+  if (isProcessingTool.value || activeLineIdx.value < 0) return
+  isProcessingTool.value = true
+  try {
+    await projectStore.splitLine(activeLineIdx.value)
+    showToolNotice('⤸ Строка разбита по паузе вдоха')
+  } catch (e: any) {
+    showToolNotice(e.message || 'Не удалось разбить строку')
+  } finally {
+    isProcessingTool.value = false
+  }
+}
+
+async function handleJoinActiveLine() {
+  if (isProcessingTool.value || activeLineIdx.value < 0) return
+  isProcessingTool.value = true
+  try {
+    await projectStore.joinLine(activeLineIdx.value)
+    showToolNotice('⤹ Строка склеена со следующей')
+  } catch (e: any) {
+    showToolNotice(e.message || 'Не удалось склеить строки')
+  } finally {
+    isProcessingTool.value = false
+  }
+}
+
 async function handleOptimizeTimings() {
   if (isProcessingTool.value) return
   isProcessingTool.value = true
   try {
-    const data = await projectStore.optimizeTimings(90)
+    const data = await projectStore.optimizeTimings(99)
     if (data) {
       const score = data.alignment_report?.overall_score
-      showToolNotice(
-        score !== undefined
-          ? `🎯 Точность таймингов: ${Number(score).toFixed(1)}%`
-          : '🎯 Автоподгонка таймингов завершена',
-      )
+      const hist = data.alignment_report?.iterations_history
+      if (hist && hist.length > 1) {
+        const trail = hist.map((h: any) => `${Number(h.overall_score).toFixed(1)}%`).join(' → ')
+        showToolNotice(`🎯 Итерации: ${trail}`)
+      } else {
+        showToolNotice(
+          score !== undefined
+            ? `🎯 Точность таймингов: ${Number(score).toFixed(1)}%`
+            : '🎯 Автоподгонка таймингов завершена',
+        )
+      }
     }
   } finally {
     isProcessingTool.value = false
@@ -456,6 +498,28 @@ async function handleOptimizeTimings() {
 
       <div class="grid grid-cols-2 gap-1.5">
         <button
+          @click="handleSplitActiveLine"
+          :disabled="!projectStore.hasProject || isProcessingTool || activeLineIdx < 0"
+          class="flex items-center justify-center space-x-1 py-1 px-2 rounded text-[11px] font-medium bg-studio-surface hover:bg-slate-700 text-sky-300 border border-studio-border disabled:opacity-40 transition-colors"
+          title="Разбить текущую строку на две по самой длинной паузе (вдоху) без сброса таймингов"
+        >
+          <span>⤸</span>
+          <span class="truncate">Разбить по вдоху</span>
+        </button>
+
+        <button
+          @click="handleJoinActiveLine"
+          :disabled="!projectStore.hasProject || isProcessingTool || activeLineIdx < 0"
+          class="flex items-center justify-center space-x-1 py-1 px-2 rounded text-[11px] font-medium bg-studio-surface hover:bg-slate-700 text-sky-300 border border-studio-border disabled:opacity-40 transition-colors"
+          title="Склеить текущую строку со следующей без сброса таймингов"
+        >
+          <span>⤹</span>
+          <span class="truncate">Склеить со след.</span>
+        </button>
+      </div>
+
+      <div class="grid grid-cols-2 gap-1.5">
+        <button
           @click="handleRealignTimings"
           :disabled="!projectStore.hasProject || isProcessingTool"
           class="flex items-center justify-center space-x-1 py-1.5 px-2 rounded text-[11px] font-medium bg-studio-surface hover:bg-slate-700 text-emerald-300 border border-studio-border disabled:opacity-40 transition-colors"
@@ -469,10 +533,10 @@ async function handleOptimizeTimings() {
           @click="handleOptimizeTimings"
           :disabled="!projectStore.hasProject || isProcessingTool"
           class="flex items-center justify-center space-x-1 py-1.5 px-2 rounded text-[11px] font-medium bg-studio-surface hover:bg-slate-700 text-amber-300 border border-studio-border disabled:opacity-40 transition-colors"
-          title="Подогнать тайминги строк по вокалу (Whisper+RMS vs CTC) до 90%+"
+          title="Подогнать тайминги строк по вокалу (Whisper+RMS vs CTC) итеративно до 99%+"
         >
           <span>🎯</span>
-          <span class="truncate">Авто 90%+</span>
+          <span class="truncate">Авто 99%+</span>
         </button>
       </div>
 
@@ -490,6 +554,13 @@ async function handleOptimizeTimings() {
           вступления {{ Math.round(projectStore.currentProject.alignment_report.onset_score) }}% ·
           покрытие {{ Math.round(projectStore.currentProject.alignment_report.coverage_score) }}% ·
           темп {{ Math.round(projectStore.currentProject.alignment_report.tempo_score) }}%
+        </div>
+        <div
+          v-if="(projectStore.currentProject.alignment_report.iterations_history?.length ?? 0) > 1"
+          class="text-[10px] text-emerald-300/90 mt-0.5 truncate"
+          :title="projectStore.currentProject.alignment_report.iterations_history!.map(h => `#${h.iter}: ${h.overall_score.toFixed(1)}%`).join(' → ')"
+        >
+          Прогресс: {{ projectStore.currentProject.alignment_report.iterations_history!.map(h => `${h.overall_score.toFixed(1)}%`).join(' → ') }}
         </div>
       </div>
 

@@ -666,6 +666,10 @@ def generate_ass_from_lines(
         f"Style: KaraokeActive,Arial,{f_active},{clean_sweep},&H00FFFFFF,&H00000000,&H90000000,"
         f"-1,0,0,0,100,100,0.5,0,1,4.5,2.8,2,70,70,{mv_active},1"
     )
+    style_active_v2 = (
+        f"Style: KaraokeActiveVoice2,Arial,{f_active},&H00FFE66D,&H00FFD2A6,&H00000000,&H90000000,"
+        f"-1,0,0,0,100,100,0.5,0,1,4.5,2.8,2,70,70,{mv_active},1"
+    )
     style_prev = (
         f"Style: KaraokePrev,Arial,{f_prev},&H00999999,&H00999999,&H00000000,&H90000000,"
         f"0,0,0,0,100,100,0.5,0,1,3.2,1.8,2,70,70,{mv_prev},1"
@@ -683,19 +687,21 @@ def generate_ass_from_lines(
             f"0,0,0,0,100,100,0.5,0,1,3.2,1.8,2,70,70,{mv_next2},1"
         )
         countdown_margin = mv_prev + 105
-        styles_list = [style_prev, style_active, style_next, style_next2]
+        styles_list = [style_prev, style_active, style_active_v2, style_next, style_next2]
         style_meta = {
             "KaraokePrev": (f_prev, False, mv_prev),
             "KaraokeActive": (f_active, True, mv_active),
+            "KaraokeActiveVoice2": (f_active, True, mv_active),
             "KaraokeNext": (f_next, False, mv_next),
             "KaraokeNextNext": (f_next2, False, mv_next2),
         }
     else:
         countdown_margin = mv_prev + 100
-        styles_list = [style_prev, style_active, style_next]
+        styles_list = [style_prev, style_active, style_active_v2, style_next]
         style_meta = {
             "KaraokePrev": (f_prev, False, mv_prev),
             "KaraokeActive": (f_active, True, mv_active),
+            "KaraokeActiveVoice2": (f_active, True, mv_active),
             "KaraokeNext": (f_next, False, mv_next),
         }
 
@@ -913,8 +919,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if t_e <= t_s:
                 continue
 
-            # 1. Slot 1 (ACTIVE line with gold sweep)
-            _emit("KaraokeActive", 1, t_s, t_e, stanza[i], karaoke=True)
+            # 1. Slot 1 (ACTIVE line with gold sweep, or Voice 2 cyan/neon sweep)
+            is_voice2 = any(int(w.get("voice", 1)) == 2 for w in stanza[i])
+            _emit("KaraokeActiveVoice2" if is_voice2 else "KaraokeActive", 1, t_s, t_e, stanza[i], karaoke=True)
 
             # 2. Slot 0 (PREVIOUS sung line, dimmed)
             if i > 0:

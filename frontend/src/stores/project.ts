@@ -411,6 +411,11 @@ export const useProjectStore = defineStore('project', () => {
     if (!res.ok) throw new Error('Не удалось сохранить отметку строки')
     const data = await res.json()
     lineMarkByIdx.value = data.line_mark_by_idx || {}
+    if (mark === 'bad') {
+      addPendingRealign(lineIdx)
+    } else {
+      removePendingRealign(lineIdx)
+    }
   }
 
   async function restoreTimingSnapshot(snapId: string) {
@@ -449,6 +454,9 @@ export const useProjectStore = defineStore('project', () => {
       currentProject.value.editor_text = data.editor_text
       if (data.alignment_report) {
         currentProject.value.alignment_report = data.alignment_report
+      }
+      if (data.line_mark_by_idx) {
+        lineMarkByIdx.value = data.line_mark_by_idx
       }
       pushHistory()
       await fetchTimingHistory(currentProject.value.title)
@@ -523,6 +531,46 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  async function splitLine(lineIdx: number, wordIdx?: number) {
+    if (!currentProject.value) return null
+    const title = encodeURIComponent(currentProject.value.title)
+    const res = await fetch(`/api/project/${title}/split-line`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ line_idx: lineIdx, word_idx: wordIdx }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || 'Не удалось разбить строку')
+    }
+    const data = await res.json()
+    currentProject.value.lines = data.lines
+    currentProject.value.editor_text = data.editor_text
+    pushHistory()
+    await fetchTimingHistory(currentProject.value.title)
+    return data
+  }
+
+  async function joinLine(lineIdx: number) {
+    if (!currentProject.value) return null
+    const title = encodeURIComponent(currentProject.value.title)
+    const res = await fetch(`/api/project/${title}/join-line`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ line_idx: lineIdx }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || 'Не удалось склеить строки')
+    }
+    const data = await res.json()
+    currentProject.value.lines = data.lines
+    currentProject.value.editor_text = data.editor_text
+    pushHistory()
+    await fetchTimingHistory(currentProject.value.title)
+    return data
+  }
+
   return {
     projects,
     currentProject,
@@ -562,6 +610,8 @@ export const useProjectStore = defineStore('project', () => {
     removePendingRealign,
     clearPendingRealign,
     realignPendingLines,
+    splitLine,
+    joinLine,
     undo,
     redo,
     canUndo: computed(() => historyIndex.value > 0),

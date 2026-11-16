@@ -26,7 +26,7 @@ const pipelineStore = usePipelineStore()
 const playerStore = usePlayerStore()
 
 const videoQuality = ref('balanced')
-const vocalVolumePct = ref(Math.min(100, Math.round((playerStore.liveVocalMultiplier || 0) * 100)))
+const vocalVolumePct = ref(0)
 const numLines = ref(4)
 const bgMode = ref<'cover' | 'custom' | 'video'>('cover')
 const visualEffects = ref('sparkles_pulse')
@@ -35,9 +35,12 @@ const fontSizeMode = ref('large')
 const highlightColor = ref('gold_neon')
 const dualAudioMp4 = ref(true)
 const watermarkText = ref(projectStore.currentProject?.watermark_text || '')
+const pitchSemitones = ref(0)
 const isExportingDjPack = ref(false)
 const djPackResult = ref<{ dj_pack_url: string; kfn_url: string; dj_pack_filename: string; kfn_filename: string; exported_dir?: string } | null>(null)
 const djExportError = ref('')
+const isExportingHtml = ref(false)
+const htmlResult = ref<{ html_url: string; filename: string } | null>(null)
 
 const exportDir = ref<string>(localStorage.getItem('studio_export_dir') || '')
 const presetFolders = ref<Record<string, string>>({})
@@ -163,6 +166,7 @@ async function onSubmit() {
     dual_audio_mp4: dualAudioMp4.value,
     watermark_text: watermarkText.value.trim() || null,
     export_dir: exportDir.value || null,
+    pitch_semitones: pitchSemitones.value,
   })
 
   emit('close')
@@ -193,6 +197,34 @@ async function onBuildDjPack() {
     djExportError.value = e.message || 'Ошибка при экспорте DJ-пака'
   } finally {
     isExportingDjPack.value = false
+  }
+}
+
+async function onBuildStandaloneHtml() {
+  if (!projectStore.currentProject) return
+  isExportingHtml.value = true
+  djExportError.value = ''
+  htmlResult.value = null
+  try {
+    const res = await fetch(`/api/project/${encodeURIComponent(projectStore.currentProject.title)}/export-html`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        editor_text: projectStore.currentProject.editor_text,
+        vocal_volume: vocalVolumePct.value / 100,
+        vocal_intervals: projectStore.currentProject.vocal_intervals,
+        pitch_semitones: pitchSemitones.value,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || 'Ошибка сборки HTML-плеера')
+    }
+    htmlResult.value = await res.json()
+  } catch (e: any) {
+    djExportError.value = e.message || 'Ошибка экспорта HTML'
+  } finally {
+    isExportingHtml.value = false
   }
 }
 </script>
@@ -260,6 +292,27 @@ async function onBuildDjPack() {
             <span>0% (Чистый минус)</span>
             <span>10% (Бэк-вокал)</span>
             <span>100% (Оригинал)</span>
+          </div>
+        </div>
+
+        <!-- Pitch Shift -->
+        <div>
+          <div class="flex justify-between mb-1">
+            <label class="text-slate-300 font-medium">🎼 Тональность (полутоны, без изменения темпа):</label>
+            <span class="font-mono text-sky-400 font-bold">{{ pitchSemitones > 0 ? `+${pitchSemitones}` : pitchSemitones }}</span>
+          </div>
+          <input
+            type="range"
+            min="-6"
+            max="6"
+            step="1"
+            v-model.number="pitchSemitones"
+            class="w-full bg-slate-700 h-1.5 rounded cursor-pointer"
+          />
+          <div class="flex justify-between text-[10px] text-studio-muted mt-1">
+            <span>-6 (ниже)</span>
+            <span>0 (оригинал)</span>
+            <span>+6 (выше)</span>
           </div>
         </div>
 
@@ -478,15 +531,37 @@ async function onBuildDjPack() {
                     Собирает .KFN (EnCore!/KaraFun), MP3+G (.CDG.zip для VirtualDJ/OpenKJ), Enhanced .LRC, UltraStar .TXT и MP3 стемы
                   </div>
                 </div>
-                <button
-                  type="button"
-                  :disabled="isExportingDjPack"
-                  @click="onBuildDjPack"
-                  class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold text-xs shrink-0 flex items-center space-x-1 transition-colors"
+                <div class="flex items-center space-x-1.5 shrink-0">
+                  <button
+                    type="button"
+                    :disabled="isExportingHtml"
+                    @click="onBuildStandaloneHtml"
+                    class="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-semibold text-xs flex items-center space-x-1 transition-colors"
+                    title="Один автономный .html файл с музыкой, обложкой и караоке"
+                  >
+                    <span>{{ isExportingHtml ? 'Сборка...' : '🌐 HTML' }}</span>
+                  </button>
+                  <button
+                    type="button"
+                    :disabled="isExportingDjPack"
+                    @click="onBuildDjPack"
+                    class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold text-xs flex items-center space-x-1 transition-colors"
+                  >
+                    <Sparkles class="w-3.5 h-3.5" />
+                    <span>{{ isExportingDjPack ? 'Сборка...' : 'Собрать DJ-пак' }}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div v-if="htmlResult" class="flex flex-wrap gap-2 pt-1">
+                <a
+                  :href="htmlResult.html_url"
+                  :download="htmlResult.filename"
+                  class="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px] flex items-center space-x-1"
                 >
-                  <Sparkles class="w-3.5 h-3.5" />
-                  <span>{{ isExportingDjPack ? 'Сборка...' : 'Собрать DJ-пак' }}</span>
-                </button>
+                  <Download class="w-3 h-3" />
+                  <span>Скачать {{ htmlResult.filename }} (Автономный плеер)</span>
+                </a>
               </div>
 
               <div v-if="djExportError" class="text-[11px] text-rose-400">

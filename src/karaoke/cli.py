@@ -19,6 +19,7 @@ from karaoke.aligner import (
 from karaoke.mixer import (
     mix_guide_vocals,
     ensure_full_guide_mix,
+    shift_pitch_wav,
     compute_waveform_peaks,
     detect_chorus_fx_intervals,
 )
@@ -34,7 +35,7 @@ def analyze_and_transcribe(
     demucs_model: str = "htdemucs",
     language: str = "ru",
     reference_lyrics: Optional[str] = None,
-    use_ctc_align: bool = True,
+    use_ctc_align: bool = False,
     device: Optional[str] = None,
     download_video: bool = False,
     cookies_browser: Optional[str] = "chrome",
@@ -264,6 +265,7 @@ def render_from_state(
     dual_audio_mp4: bool = True,
     watermark_text: Optional[str] = None,
     export_dj_pack: bool = False,
+    pitch_semitones: float = 0.0,
     progress_callback=None,
 ) -> Tuple[Path, Path, str]:
     """
@@ -328,6 +330,21 @@ def render_from_state(
             vocals_path=vocals_wav,
             output_path=work_dir / f"{title}_guide_100pct.wav",
         )
+
+    if abs(float(pitch_semitones or 0.0)) >= 0.01:
+        pitch_tag = f"{float(pitch_semitones):+.1f}".replace("+", "p").replace("-", "m").replace(".", "_")
+        log(f"Сдвиг тональности ({float(pitch_semitones):+.1f} полутонов)...", 0.78)
+        backing_audio = shift_pitch_wav(
+            backing_audio,
+            work_dir / f"{title}_mix_{vol_pct}pct_{pitch_tag}.wav",
+            pitch_semitones,
+        )
+        if guide_full_wav and guide_full_wav.exists():
+            guide_full_wav = shift_pitch_wav(
+                guide_full_wav,
+                work_dir / f"{title}_guide_100pct_{pitch_tag}.wav",
+                pitch_semitones,
+            )
 
     effective_watermark = watermark_text if watermark_text is not None else state_data.get("watermark_text")
 
@@ -459,7 +476,7 @@ def run_pipeline(
     vocal_volume: float = 0.0,
     num_lines: int = 4,
     reference_lyrics: Optional[str] = None,
-    use_ctc_align: bool = True,
+    use_ctc_align: bool = False,
     device: Optional[str] = None,
     cookies_browser: Optional[str] = "chrome",
     cookies_file: Optional[Path] = None,

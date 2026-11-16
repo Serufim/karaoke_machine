@@ -10,7 +10,10 @@ Generates industry-standard karaoke formats from AI Karaoke Studio project state
 4. UltraStar Deluxe / Play (.txt) with FFT vocal pitch detection (MIDI notes) for singing battles.
 5. Complete DJ Master Pack (.zip) bundling all formats and 320kbps MP3 stems.
 """
+import base64
+import html as _html
 import io
+import json
 import math
 import shutil
 import tempfile
@@ -881,12 +884,27 @@ def export_dj_master_pack(
         else None
     )
 
+    html_path = output_dir / f"{title}_karaoke.html"
+    try:
+        export_standalone_html(
+            lines=lines,
+            instrumental_wav=backing_audio,
+            output_path=html_path,
+            title=title,
+            vocals_wav=vocals_wav if vocals_wav.exists() else None,
+            cover_path=cover_image if (cover_image and cover_image.exists()) else None,
+        )
+    except Exception:
+        html_path = None
+
     dj_zip_path = output_dir / f"{title}_DJ_Pack.zip"
     with zipfile.ZipFile(dj_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.write(kfn_path, arcname=kfn_path.name)
         zf.write(cdg_zip_path, arcname=cdg_zip_path.name)
         zf.write(lrc_path, arcname=lrc_path.name)
         zf.write(ultrastar_path, arcname=ultrastar_path.name)
+        if html_path and html_path.exists():
+            zf.write(html_path, arcname=html_path.name)
         zf.write(inst_mp3, arcname=f"{title}_instrumental.mp3")
         if voc_mp3 and voc_mp3.exists():
             zf.write(voc_mp3, arcname=f"{title}_vocals.mp3")
@@ -896,3 +914,222 @@ def export_dj_master_pack(
 
     log(f"DJ-пак готов: {dj_zip_path.name} и {kfn_path.name}", 1.0)
     return dj_zip_path, kfn_path
+
+
+def export_standalone_html(
+    lines: List[List[Dict[str, Any]]],
+    instrumental_wav: Path,
+    output_path: Path,
+    title: str = "Karaoke",
+    vocals_wav: Optional[Path] = None,
+    cover_path: Optional[Path] = None,
+) -> Path:
+    """
+    Exports a single self-contained offline HTML5 karaoke player (<title>_karaoke.html)
+    with embedded base64 MP3 tracks (instrumental + guide vocals), cover backdrop,
+    syllable-level sweep highlighting, dual-voice styling, and a live vocal slider.
+    """
+    validate_karaoke_lines(lines)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="karaoke_html_") as tmp_dir:
+        tmp = Path(tmp_dir)
+        inst_mp3 = _encode_mp3(Path(instrumental_wav), tmp / "inst.mp3", bitrate="128k")
+        inst_b64 = base64.b64encode(inst_mp3.read_bytes()).decode("ascii")
+        inst_uri = f"data:audio/mpeg;base64,{inst_b64}"
+
+        voc_uri = ""
+        if vocals_wav and Path(vocals_wav).exists():
+            voc_mp3 = _encode_mp3(Path(vocals_wav), tmp / "voc.mp3", bitrate="96k")
+            voc_b64 = base64.b64encode(voc_mp3.read_bytes()).decode("ascii")
+            voc_uri = f"data:audio/mpeg;base64,{voc_b64}"
+
+    cover_uri = ""
+    if cover_path and Path(cover_path).exists():
+        ext = Path(cover_path).suffix.lower().lstrip(".") or "jpeg"
+        if ext == "jpg":
+            ext = "jpeg"
+        cover_b64 = base64.b64encode(Path(cover_path).read_bytes()).decode("ascii")
+        cover_uri = f"data:image/{ext};base64,{cover_b64}"
+
+    payload = []
+    for ln in lines:
+        if not ln:
+            continue
+        is_v2 = any(int(w.get("voice", 1)) == 2 for w in ln)
+        words_out = []
+        for w in ln:
+            st = w.get("syllable_timings")
+            if isinstance(st, list) and st:
+                syls = [{"t": str(s["text"]), "s": round(float(s["start"]), 3), "e": round(float(s["end"]), 3)} for s in st]
+            else:
+                syls = [{"t": str(w["text"]), "s": round(float(w["start"]), 3), "e": round(float(w["end"]), 3)}]
+            words_out.append({
+                "t": str(w["text"]),
+                "s": round(float(w["start"]), 3),
+                "e": round(float(w["end"]), 3),
+                "syls": syls,
+            })
+        payload.append({
+            "s": round(float(ln[0]["start"]), 3),
+            "e": round(float(ln[-1]["end"]), 3),
+            "v": 2 if is_v2 else 1,
+            "w": words_out,
+        })
+
+    safe_title = _html.escape(title)
+    lines_json = json.dumps(payload, ensure_ascii=False)
+    bg_css = (
+        f"background-image:url('{cover_uri}');"
+        if cover_uri
+        else "background:radial-gradient(circle at 30% 20%,#1e293b,#090d16);"
+    )
+
+    html_doc = f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>{safe_title} — AI Karaoke Studio</title>
+<style>
+  :root {{ --gold:#fbbf24; --v2:#38bdf8; --bg:#090d16; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:#f8fafc; height:100vh; display:flex; flex-direction:column; overflow:hidden; }}
+  .bg {{ position:fixed; inset:-40px; {bg_css} background-size:cover; background-position:center; filter:blur(28px) brightness(.32); z-index:-1; }}
+  header {{ padding:12px 20px; display:flex; align-items:center; justify-content:space-between; background:rgba(9,13,22,.65); border-bottom:1px solid rgba(255,255,255,.08); backdrop-filter:blur(10px); }}
+  h1 {{ margin:0; font-size:15px; font-weight:600; color:#f1f5f9; }}
+  .stage {{ flex:1; overflow-y:auto; padding:26vh 8vw 40vh; scroll-behavior:smooth; text-align:center; }}
+  .line {{ margin:18px 0; font-size:clamp(22px,3.2vw,38px); font-weight:700; line-height:1.35; opacity:.38; transition:opacity .25s, transform .25s; cursor:pointer; text-shadow:0 2px 10px rgba(0,0,0,.85); }}
+  .line.active {{ opacity:1; transform:scale(1.04); }}
+  .line.done {{ opacity:.22; }}
+  .line.v2 .word.lit, .line.v2 .syl.lit {{ color:var(--v2); }}
+  .word {{ display:inline-block; margin:0 .16em; }}
+  .syl {{ position:relative; display:inline-block; color:#e2e8f0; }}
+  .syl.lit {{ color:var(--gold); }}
+  .controls {{ padding:12px 20px; background:rgba(9,13,22,.82); border-top:1px solid rgba(255,255,255,.1); display:flex; flex-wrap:wrap; align-items:center; gap:14px; backdrop-filter:blur(12px); }}
+  button {{ background:#f59e0b; color:#0f172a; border:none; border-radius:8px; padding:8px 16px; font-weight:700; cursor:pointer; font-size:13px; }}
+  input[type=range] {{ accent-color:#f59e0b; cursor:pointer; }}
+  .seek {{ flex:1; min-width:160px; }}
+  .time {{ font-family:ui-monospace,monospace; font-size:12px; color:#94a3b8; min-width:92px; text-align:right; }}
+  .vol-wrap {{ display:flex; align-items:center; gap:8px; font-size:12px; color:#cbd5e1; }}
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<header><h1>🎤 {safe_title}</h1><span style="font-size:12px;color:#94a3b8;">AI Karaoke Studio · Offline Player</span></header>
+<main class="stage" id="stage"></main>
+<footer class="controls">
+  <button id="playBtn">▶ Старт</button>
+  <input id="seek" class="seek" type="range" min="0" max="100" step="0.05" value="0" />
+  <span class="time" id="timeLbl">00:00 / 00:00</span>
+  <div class="vol-wrap" id="vocWrap" style="display:{'flex' if voc_uri else 'none'}">
+    <span>Голос:</span>
+    <input id="vocVol" type="range" min="0" max="100" step="5" value="0" style="width:90px" />
+    <span id="vocPct">0%</span>
+  </div>
+</footer>
+<audio id="inst" preload="auto" src="{inst_uri}"></audio>
+{'<audio id="voc" preload="auto" src="' + voc_uri + '"></audio>' if voc_uri else ''}
+<script>
+const LINES = {lines_json};
+const stage = document.getElementById('stage');
+const inst = document.getElementById('inst');
+const voc = document.getElementById('voc');
+const playBtn = document.getElementById('playBtn');
+const seek = document.getElementById('seek');
+const timeLbl = document.getElementById('timeLbl');
+const vocVol = document.getElementById('vocVol');
+const vocPct = document.getElementById('vocPct');
+
+const fmt = s => {{ s = Math.max(0, s || 0); const m = Math.floor(s/60), sc = Math.floor(s%60); return String(m).padStart(2,'0')+':'+String(sc).padStart(2,'0'); }};
+
+const lineEls = LINES.map((ln, idx) => {{
+  const div = document.createElement('div');
+  div.className = 'line' + (ln.v === 2 ? ' v2' : '');
+  div.onclick = () => {{ inst.currentTime = ln.s; if (voc) voc.currentTime = ln.s; }};
+  ln._sylEls = [];
+  ln.w.forEach(w => {{
+    const wSpan = document.createElement('span');
+    wSpan.className = 'word';
+    w.syls.forEach(sy => {{
+      const sSpan = document.createElement('span');
+      sSpan.className = 'syl';
+      sSpan.textContent = sy.t;
+      wSpan.appendChild(sSpan);
+      ln._sylEls.push({{ el: sSpan, s: sy.s, e: sy.e }});
+    }});
+    div.appendChild(wSpan);
+  }});
+  stage.appendChild(div);
+  return div;
+}});
+
+function syncVocVolume() {{
+  if (!voc || !vocVol) return;
+  const v = Number(vocVol.value) / 100;
+  voc.volume = v;
+  voc.muted = v <= 0.005;
+  vocPct.textContent = vocVol.value + '%';
+}}
+if (vocVol) {{ vocVol.oninput = syncVocVolume; syncVocVolume(); }}
+
+playBtn.onclick = () => {{
+  if (inst.paused) {{
+    if (voc && Math.abs(voc.currentTime - inst.currentTime) > 0.06) voc.currentTime = inst.currentTime;
+    inst.play();
+    if (voc) voc.play().catch(() => {{}});
+    playBtn.textContent = '⏸ Пауза';
+  }} else {{
+    inst.pause();
+    if (voc) {{ voc.pause(); voc.playbackRate = 1.0; }}
+    playBtn.textContent = '▶ Старт';
+  }}
+}};
+
+seek.oninput = () => {{
+  const t = Number(seek.value);
+  inst.currentTime = t;
+  if (voc) voc.currentTime = t;
+}};
+
+inst.onloadedmetadata = () => {{ seek.max = inst.duration || 100; }};
+
+let lastActive = -1;
+function tick() {{
+  const t = inst.currentTime || 0;
+  seek.value = t;
+  timeLbl.textContent = fmt(t) + ' / ' + fmt(inst.duration || 0);
+
+  if (voc && !inst.paused && !voc.paused) {{
+    const diff = t - voc.currentTime;
+    if (Math.abs(diff) > 0.6) voc.currentTime = t;
+    else if (Math.abs(diff) > 0.08) voc.playbackRate = diff > 0 ? 1.05 : 0.95;
+    else if (voc.playbackRate !== 1.0) voc.playbackRate = 1.0;
+  }}
+
+  let activeIdx = -1;
+  LINES.forEach((ln, idx) => {{
+    const el = lineEls[idx];
+    const isAct = t >= ln.s - 0.15 && t <= ln.e + 0.25;
+    const isDone = t > ln.e + 0.25;
+    el.classList.toggle('active', isAct);
+    el.classList.toggle('done', isDone && !isAct);
+    if (isAct) activeIdx = idx;
+    ln._sylEls.forEach(sy => {{
+      sy.el.classList.toggle('lit', t >= sy.s);
+    }});
+  }});
+  if (activeIdx !== -1 && activeIdx !== lastActive) {{
+    lastActive = activeIdx;
+    lineEls[activeIdx].scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+  }}
+  requestAnimationFrame(tick);
+}}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
+"""
+    output_path.write_text(html_doc, encoding="utf-8")
+    return output_path

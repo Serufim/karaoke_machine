@@ -62,6 +62,29 @@ const activeTab = ref<'file' | 'url'>('file')
 const selectedFile = ref<File | null>(null)
 const youtubeUrl = ref('')
 const referenceLyrics = ref('')
+const lrclibQuery = ref('')
+const lrclibLoading = ref(false)
+const lrclibError = ref('')
+const lrclibResults = ref<Array<{ title: string; artist: string; duration: number; lines_count: number; text: string; timed: boolean; text_timed: string }>>([])
+
+async function searchLrclibLyrics() {
+  const fallbackName = props.initialData?.projectTitle || selectedFile.value?.name.replace(/\.[^.]+$/, '') || youtubeUrl.value
+  const q = (lrclibQuery.value || fallbackName || '').trim()
+  if (!q || lrclibLoading.value) return
+  lrclibLoading.value = true
+  lrclibError.value = ''
+  try {
+    const res = await fetch(`/api/lyrics/search?q=${encodeURIComponent(q)}&limit=5`)
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || 'Ошибка поиска LRCLIB')
+    lrclibResults.value = data.results || []
+    if (lrclibResults.value.length === 0) lrclibError.value = 'Ничего не найдено в LRCLIB'
+  } catch (e: any) {
+    lrclibError.value = e.message || 'Ошибка поиска LRCLIB'
+  } finally {
+    lrclibLoading.value = false
+  }
+}
 const coverFile = ref<File | null>(null)
 const coverPreview = ref<string | null>(null)
 
@@ -358,15 +381,45 @@ function onSubmit() {
         </div>
 
         <!-- Reference Lyrics -->
-        <div class="space-y-1">
-          <label class="text-xs font-medium text-slate-300 flex justify-between">
-            <span>Текст песни (необязательно):</span>
-            <span class="text-studio-muted text-[10px]">Каждая строка станет строкой караоке</span>
-          </label>
+        <div class="space-y-1.5">
+          <div class="flex items-center justify-between">
+            <label class="text-xs font-medium text-slate-300">Текст песни (необязательно):</label>
+            <span class="text-studio-muted text-[10px]">[1:05] колышки · x4 повторы · [Соло 1:02-1:40] · 2: бэк · сло=ги</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <input
+              v-model="lrclibQuery"
+              type="text"
+              placeholder="Поиск текста в LRCLIB (Исполнитель - Трек)..."
+              @keydown.enter.prevent="searchLrclibLyrics"
+              class="flex-1 bg-studio-surface border border-studio-border rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500"
+            />
+            <button
+              type="button"
+              @click="searchLrclibLyrics"
+              :disabled="lrclibLoading"
+              class="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 disabled:opacity-40"
+            >
+              {{ lrclibLoading ? 'Поиск...' : '🔍 LRCLIB' }}
+            </button>
+          </div>
+          <p v-if="lrclibError" class="text-[11px] text-amber-400">{{ lrclibError }}</p>
+          <div v-if="lrclibResults.length > 0" class="max-h-28 overflow-y-auto space-y-1 bg-studio-surface/70 border border-studio-border rounded-lg p-1.5">
+            <div v-for="(item, idx) in lrclibResults" :key="idx" class="flex items-center justify-between text-[11px] px-2 py-1 rounded hover:bg-slate-700/50">
+              <div class="truncate pr-2 text-slate-200">
+                <span class="font-medium">{{ item.artist }} — {{ item.title }}</span>
+                <span class="text-studio-muted ml-1">({{ item.lines_count }} стр.)</span>
+              </div>
+              <div class="flex items-center space-x-1 shrink-0">
+                <button type="button" @click="referenceLyrics = item.text; lrclibResults = []" class="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">Текст</button>
+                <button v-if="item.timed" type="button" @click="referenceLyrics = item.text_timed; lrclibResults = []" class="px-1.5 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30" title="Вставить с опорными LRC-колышками">📌 LRC</button>
+              </div>
+            </div>
+          </div>
           <textarea
             v-model="referenceLyrics"
             rows="8"
-            placeholder="Вставьте официальный текст песни (куплеты, припевы). Нейросеть идеально разобьет тайминги по вашим строкам..."
+            placeholder="Вставьте текст песни или найдите через LRCLIB. Поддерживаются [1:05] колышки, x4 повторы, [Соло 1:02-1:40], 2: бэк-вокал, поётся | на экране, ручные сло=ги..."
             class="w-full bg-studio-surface border border-studio-border rounded-lg p-3 text-xs text-white focus:outline-none focus:border-sky-500 font-mono resize-y min-h-[140px] max-h-[340px] leading-relaxed"
           ></textarea>
         </div>
